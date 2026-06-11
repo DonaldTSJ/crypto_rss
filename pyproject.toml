@@ -1,0 +1,20 @@
+[project]
+name = "crypto-rss"
+version = "0.1.0"
+description = "Crypto/RWA RSS intelligence collection, Lark/Feishu push, and Obsidian Markdown pipeline."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+crypto-rss = "rwa_intel_mvp.cli:main"
+cytop = "rwa_intel_mvp.cli:main"
+rwa-intel = "rwa_intel_mvp.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rwa_intel_mvp*"]
