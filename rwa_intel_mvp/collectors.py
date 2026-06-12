@@ -8,6 +8,8 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime
+from html import unescape
 from html.parser import HTMLParser
 from typing import Any
 
@@ -292,12 +294,14 @@ def collect_web_page(source: Source) -> RawItem:
 def build_listing_item(source: Source, link: LinkCandidate) -> RawItem:
     title = link.title
     text = link.title
+    published_at = None
     try:
         detail_html = fetch_text(link.url, headers=source.headers)
         detail_title = extract_title(detail_html)
         if detail_title and _should_use_detail_title(title, detail_title):
             title = detail_title
         detail_text = strip_html(detail_html)
+        published_at = extract_published_at(detail_html, detail_text, title)
         if detail_text:
             text = detail_text
     except CollectError:
@@ -309,6 +313,7 @@ def build_listing_item(source: Source, link: LinkCandidate) -> RawItem:
         title=title,
         url=link.url,
         source_category=source.category,
+        published_at=published_at,
         summary=text[:2000],
         raw_text=text[:MAX_TEXT_CHARS],
         extraction_method="listing_item",
@@ -318,6 +323,7 @@ def build_listing_item(source: Source, link: LinkCandidate) -> RawItem:
 def build_web_page_item(source: Source, html: str) -> RawItem:
     title = extract_title(html) or source.name
     text = strip_html(html)
+    published_at = extract_published_at(html, text, title)
     return RawItem(
         source_name=source.name,
         source_kind=source.kind,
@@ -325,6 +331,7 @@ def build_web_page_item(source: Source, html: str) -> RawItem:
         title=title,
         url=source.url,
         source_category=source.category,
+        published_at=published_at,
         summary=text[:2000],
         raw_text=text[:MAX_TEXT_CHARS],
         extraction_method="web_page",
@@ -431,6 +438,156 @@ def extract_title(html: str) -> str | None:
     if not match:
         return None
     return re.sub(r"\s+", " ", strip_html(match.group(1))).strip()
+
+
+def extract_published_at(html: str, text: str | None = None, title: str | None = None) -> str | None:
+    for candidate in _metadata_date_candidates(html):
+        normalized = _normalize_published_date(candidate)
+        if normalized:
+            return normalized
+    visible_text = text or strip_html(html)
+    scoped_text = _article_date_scope(visible_text, title)
+    for candidate in _visible_date_candidates(scoped_text):
+        normalized = _normalize_published_date(candidate)
+        if normalized:
+            return normalized
+    return None
+
+
+def _metadata_date_candidates(html: str) -> list[str]:
+    candidates: list[str] = []
+    date_keys = {
+        "article:published_time",
+        "article:modified_time",
+        "date",
+        "datepublished",
+        "datecreated",
+        "dc.date",
+        "dcterms.created",
+        "og:published_time",
+        "pubdate",
+        "publishdate",
+        "published_time",
+        "sailthru.date",
+    }
+    for tag in re.findall(r"<meta\b[^>]*>", html, flags=re.IGNORECASE | re.DOTALL):
+        attrs = _tag_attrs(tag)
+        key = (attrs.get("property") or attrs.get("name") or attrs.get("itemprop") or "").strip().lower()
+        content = attrs.get("content", "").strip()
+        if key in date_keys and content:
+            candidates.append(content)
+    for tag in re.findall(r"<time\b[^>]*>", html, flags=re.IGNORECASE | re.DOTALL):
+        value = _tag_attrs(tag).get("datetime", "").strip()
+        if value:
+            candidates.append(value)
+    candidates.extend(_json_ld_date_candidates(html))
+    return candidates
+
+
+def _json_ld_date_candidates(html: str) -> list[str]:
+    candidates: list[str] = []
+    for match in re.finditer(
+        r"<script\b[^>]*type=['\"]application/ld\+json['\"][^>]*>(.*?)</script>",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        body = unescape(match.group(1)).strip()
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        candidates.extend(_walk_json_dates(data))
+    return candidates
+
+
+def _walk_json_dates(value: object) -> list[str]:
+    candidates: list[str] = []
+    if isinstance(value, dict):
+        for key in ["datePublished", "dateCreated", "dateModified", "uploadDate"]:
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                candidates.append(item.strip())
+        for item in value.values():
+            candidates.extend(_walk_json_dates(item))
+    elif isinstance(value, list):
+        for item in value:
+            candidates.extend(_walk_json_dates(item))
+    return candidates
+
+
+def _visible_date_candidates(text: str) -> list[str]:
+    candidates: list[str] = []
+    month_names = (
+        "Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|"
+        "Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
+    )
+    patterns = [
+        rf"\b(?:{month_names})\s+\d{{1,2}},\s+\d{{4}}\b",
+        rf"\b\d{{1,2}}\s+(?:{month_names})\s+\d{{4}}\b",
+        r"\b\d{4}-\d{2}-\d{2}\b",
+        r"\b\d{4}/\d{1,2}/\d{1,2}\b",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            candidates.append(match.group(0))
+    return candidates
+
+
+def _normalize_published_date(value: str) -> str | None:
+    text = unescape(str(value)).strip()
+    if not text:
+        return None
+    iso_match = re.match(r"^\d{4}-\d{2}-\d{2}(?:[T\s].*)?$", text)
+    if iso_match:
+        return text
+    for fmt in ["%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y", "%Y/%m/%d", "%Y/%-m/%-d"]:
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            continue
+    slash_match = re.match(r"^(\d{4})/(\d{1,2})/(\d{1,2})$", text)
+    if slash_match:
+        year, month, day = (int(part) for part in slash_match.groups())
+        try:
+            return datetime(year, month, day).date().isoformat()
+        except ValueError:
+            return None
+    return None
+
+
+def _article_date_scope(text: str, title: str | None) -> str:
+    clean = re.sub(r"\s+", " ", text or "").strip()
+    if not title:
+        return clean[:8000]
+    needle = re.sub(r"\s+", " ", title).strip().lower()
+    if len(needle) < 8:
+        return clean[:8000]
+    lower = clean.lower()
+    positions: list[int] = []
+    start = 0
+    while True:
+        index = lower.find(needle, start)
+        if index < 0:
+            break
+        positions.append(index)
+        start = index + 1
+    for index in positions:
+        segment = clean[index : index + 4000]
+        if _visible_date_candidates(segment):
+            return segment
+    late_positions = [index for index in positions if index > 500]
+    if late_positions:
+        return clean[late_positions[-1] : late_positions[-1] + 4000]
+    if positions:
+        return clean[positions[0] : positions[0] + 4000]
+    return clean[:8000]
+
+
+def _tag_attrs(tag: str) -> dict[str, str]:
+    attrs: dict[str, str] = {}
+    for match in re.finditer(r"([A-Za-z_:.-]+)\s*=\s*(['\"])(.*?)\2", tag, flags=re.DOTALL):
+        attrs[match.group(1).lower()] = unescape(match.group(3))
+    return attrs
 
 
 def _normalize_link(link: LinkCandidate) -> LinkCandidate | None:

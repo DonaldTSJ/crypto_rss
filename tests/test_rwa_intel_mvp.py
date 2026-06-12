@@ -226,6 +226,82 @@ class RwaIntelMvpTests(unittest.TestCase):
         self.assertIn("regulated transfer agents", items[0].raw_text)
         self.assertIn("institutional investors", items[0].summary)
 
+    def test_web_source_extracts_detail_meta_published_date(self):
+        source = Source(
+            name="Project Blog",
+            kind="web",
+            url="https://example.com/blog",
+            link_include=["/blog/"],
+        )
+        listing_html = """
+        <html><body>
+          <a href="/blog/tokenized-fund-launch">Tokenized fund launch</a>
+        </body></html>
+        """
+        article_html = """
+        <html><head>
+          <title>Tokenized fund launch</title>
+          <meta property="article:published_time" content="2026-05-28T09:30:00Z">
+        </head><body>
+          <article>Example launched a tokenized fund.</article>
+        </body></html>
+        """
+        with patch("rwa_intel_mvp.collectors.fetch_text", side_effect=[listing_html, article_html]):
+            items = collect_source(source, limit=5)
+        self.assertEqual(items[0].published_at, "2026-05-28T09:30:00Z")
+
+    def test_web_source_extracts_visible_article_date_near_title(self):
+        source = Source(
+            name="Centrifuge Blog",
+            kind="web",
+            url="https://centrifuge.io/blog",
+            link_include=["/blog/"],
+        )
+        listing_html = """
+        <html><body>
+          <a href="/blog/the-end-of-t-1-for-treasuries">The End of T+1 for Treasuries</a>
+        </body></html>
+        """
+        article_html = """
+        <html><head><title>The End of T+1 for Treasuries | Centrifuge</title></head><body>
+          <nav>Coinbase named Centrifuge a Preferred Tokenization Infrastructure.</nav>
+          <main>
+            Centrifuge / Blog / The End of T+1 for Treasuries
+            The End of T+1 for Treasuries Perspectives May 28, 2026 By ,
+            U.S. Treasury bills are among the safest instruments in global markets.
+          </main>
+        </body></html>
+        """
+        with patch("rwa_intel_mvp.collectors.fetch_text", side_effect=[listing_html, article_html]):
+            items = collect_source(source, limit=5)
+        self.assertEqual(items[0].published_at, "2026-05-28")
+
+    def test_web_source_extracts_visible_date_when_title_repeats_later(self):
+        source = Source(
+            name="Hadron by Tether",
+            kind="web",
+            url="https://hadron.tether.to/blog",
+            link_include=["/blog/"],
+        )
+        listing_html = """
+        <html><body>
+          <a href="/blog/institutional-onboarding-to-hadron-by-tether">Institutional Onboarding to Hadron by Tether</a>
+        </body></html>
+        """
+        article_html = """
+        <html><head><title>Institutional Onboarding to Hadron by Tether</title></head><body>
+          <main>
+            Institutional Onboarding to Hadron by Tether BACK TO BLOG March 30, 2026
+            A Practical Guide to Shared-Ledger Tokenization.
+          </main>
+          <section>""" + ("Related article filler. " * 80) + """</section>
+          <footer>Related articles Institutional Onboarding to Hadron by Tether</footer>
+        </body></html>
+        """
+        with patch("rwa_intel_mvp.collectors.fetch_text", side_effect=[listing_html, article_html]):
+            items = collect_source(source, limit=5)
+        self.assertEqual(items[0].published_at, "2026-03-30")
+
     def test_web_source_uses_detail_title_when_listing_title_is_url(self):
         source = Source(
             name="Project Blog",
