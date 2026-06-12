@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import http.client
 import os
 import re
 import urllib.error
@@ -32,14 +33,18 @@ KEYWORD_WEIGHTS: dict[str, int] = {
     "mica": 12,
     "treasury": 12,
     "money market": 12,
-    "stablecoin": 10,
+    "stablecoin": 9,
+    "stablecoin license": 24,
+    "stablecoin licensing": 22,
+    "stablecoin regulation": 20,
+    "stablecoin framework": 20,
     "digital bond": 12,
     "bond issuance": 9,
-    "proof of reserve": 14,
-    "proof-of-reserves": 14,
-    "proof of reserves": 14,
-    "nav": 8,
-    "collateral": 10,
+    "proof of reserve": 20,
+    "proof-of-reserves": 22,
+    "proof of reserves": 22,
+    "nav": 5,
+    "collateral": 8,
     "transfer agent": 14,
     "custodian": 10,
     "custody": 10,
@@ -58,8 +63,8 @@ KEYWORD_WEIGHTS: dict[str, int] = {
     "adgm": 10,
     "iosco": 10,
     "bis": 10,
-    "license": 10,
-    "licence": 10,
+    "license": 7,
+    "licence": 7,
     "settlement": 10,
     "clearing": 10,
     "clob": 8,
@@ -95,23 +100,25 @@ KEYWORD_WEIGHTS: dict[str, int] = {
     "chainlink": 10,
     "plume": 10,
     "hadron": 10,
-    "stock token": 14,
-    "stock tokens": 14,
-    "tokenized stock": 14,
-    "tokenized stocks": 14,
-    "tokenized securities": 16,
-    "digital securities": 14,
+    "stock": 3,
+    "stocks": 3,
+    "stock token": 16,
+    "stock tokens": 16,
+    "tokenized stock": 18,
+    "tokenized stocks": 18,
+    "tokenized securities": 26,
+    "digital securities": 20,
     "security token": 12,
-    "tokenized fund": 14,
-    "tokenized funds": 14,
-    "listing": 8,
+    "tokenized fund": 18,
+    "tokenized funds": 18,
+    "listing": 4,
     "delisting": 10,
-    "new listing": 10,
-    "api update": 8,
-    "maintenance": 6,
-    "wallet maintenance": 8,
+    "new listing": 7,
+    "api update": 6,
+    "maintenance": 2,
+    "wallet maintenance": 4,
     "governance proposal": 10,
-    "proposal": 6,
+    "proposal": 4,
 }
 
 PROJECT_TERMS: dict[str, list[str]] = {
@@ -208,6 +215,73 @@ ASSET_CLASS_TERMS: dict[str, list[str]] = {
 
 CHAIN_TERMS = ["ethereum", "solana", "polygon", "arbitrum", "avalanche", "aptos", "mantle", "sui", "xrpl", "base"]
 JURISDICTION_TERMS = ["u.s.", "us ", "united states", "singapore", "hong kong", "switzerland", "bermuda", "eu"]
+BRIEF_SUMMARY_FAILURE_FALLBACK = "摘要生成失败，请点标题查看原文。"
+
+SOURCE_CATEGORY_WEIGHTS: dict[str, dict[str, int]] = {
+    "regulator": {
+        "consultation": 8,
+        "enforcement": 10,
+        "license": 8,
+        "licence": 8,
+        "market abuse": 8,
+        "mica": 8,
+        "policy": 8,
+        "regulatory": 8,
+        "stablecoin framework": 10,
+        "stablecoin license": 10,
+        "virtual asset": 6,
+    },
+    "cex": {
+        "api update": 5,
+        "delisting": 8,
+        "new listing": 6,
+        "proof of reserve": 10,
+        "proof of reserves": 10,
+        "proof-of-reserves": 10,
+        "stablecoin": 4,
+        "wallet maintenance": 4,
+    },
+    "rwa-data": {
+        "digital securities": 8,
+        "tokenized": 6,
+        "tokenized fund": 8,
+        "tokenized securities": 12,
+        "tokenized treasuries": 10,
+    },
+    "rwa-project": {
+        "digital securities": 8,
+        "tokenization": 6,
+        "tokenized": 6,
+        "tokenized fund": 8,
+        "tokenized securities": 12,
+        "tokenized stocks": 8,
+    },
+    "rwa-infrastructure": {
+        "custody": 6,
+        "proof of reserve": 8,
+        "settlement": 6,
+        "tokenization": 6,
+        "transfer agent": 8,
+    },
+    "dex": {
+        "governance proposal": 6,
+        "proposal": 3,
+    },
+    "defi": {
+        "collateral": 5,
+        "governance proposal": 6,
+        "proposal": 3,
+        "stablecoin": 4,
+    },
+}
+
+EXTRACTION_CONFIDENCE_ADJUSTMENTS = {
+    "api_item": 0.08,
+    "feed_item": 0.06,
+    "listing_item": 0.10,
+    "record": 0.0,
+    "web_page": -0.18,
+}
 
 DEEPSEEK_SYSTEM_PROMPT = """你是一个专业的 Crypto / Web3 / 证券代币化情报助手，熟悉传统券商、加密交易所、RWA、Tokenization、稳定币结算、托管钱包、交易撮合、清算结算、合规监管与风控体系。
 
@@ -227,10 +301,15 @@ DEEPSEEK_SYSTEM_PROMPT = """你是一个专业的 Crypto / Web3 / 证券代币�
 
 不要编造链接、数据或监管结论；无法确认真实性时降低 confidence，并在 reasons 标注“待验证”。只返回严格 JSON，不要输出 Markdown。"""
 
+DEEPSEEK_SYSTEM_PROMPT = """你是 Crypto/Web3/RWA 情报分析助手。请判断输入资讯是否值得进入今日业务情报。
+重点关注：监管/牌照/处罚/政策，交易所产品与上币下币/API/钱包维护，稳定币储备和支付，RWA/证券代币化，托管清算结算基础设施。
+过滤低价值内容：价格波动、meme 炒作、空投教程、普通营销、无来源传闻。
+只返回 JSON object，字段必须包含 relevance_score、importance_score、categories、projects、asset_classes、chains、jurisdictions、summary、business_impact、next_action、confidence、reasons。中文输出，不能编造事实。"""
+
 
 def passes_rule_filter(item: RawItem, extra_keywords: list[str] | None = None) -> bool:
     haystack = _haystack(item)
-    terms = set(KEYWORD_WEIGHTS)
+    terms = set(_effective_keyword_weights(item))
     terms.update(term.lower() for term in (extra_keywords or []))
     return any(term in haystack for term in terms)
 
@@ -244,13 +323,18 @@ def analyze_item(item: RawItem, use_deepseek: bool = False) -> Analysis:
 
 def heuristic_analyze(item: RawItem) -> Analysis:
     haystack = _haystack(item)
-    matched = [term for term in KEYWORD_WEIGHTS if term in haystack]
-    relevance = min(100, sum(KEYWORD_WEIGHTS[term] for term in matched))
+    weights = _effective_keyword_weights(item)
+    matched = [term for term in weights if term in haystack]
+    relevance = _apply_extraction_score_adjustment(
+        min(100, sum(weights[term] for term in matched)),
+        item,
+    )
     importance = relevance
     if any(term in haystack for term in ["launch", "partner", "files", "approved", "integrates", "mainnet"]):
         importance = min(100, importance + 12)
     if any(term in haystack for term in ["blackrock", "jpmorgan", "franklin", "coinbase", "binance", "kraken"]):
         importance = min(100, importance + 10)
+    importance = min(100, importance + _source_importance_bonus(item, haystack))
 
     projects = _classify(PROJECT_TERMS, haystack)
     asset_classes = _classify(ASSET_CLASS_TERMS, haystack)
@@ -272,8 +356,8 @@ def heuristic_analyze(item: RawItem) -> Analysis:
         summary=summary or item.title,
         business_impact=business_impact,
         next_action=next_action,
-        confidence=0.55 if relevance else 0.25,
-        reasons=matched[:12],
+        confidence=_confidence_for(relevance, item),
+        reasons=_analysis_reasons(matched, item),
         provider="rules",
     )
 
@@ -284,7 +368,7 @@ def deepseek_analyze(item: RawItem, fallback: Analysis) -> Analysis:
         return fallback
 
     base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
+    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
     endpoint = f"{base_url}/chat/completions"
     payload = {
         "model": model,
@@ -310,7 +394,7 @@ def deepseek_analyze(item: RawItem, fallback: Analysis) -> Analysis:
                         "url": item.url,
                         "source": item.source_name,
                         "published_at": item.published_at,
-                        "text": (item.summary or item.raw_text)[:6000],
+                        "text": _keyword_context(item, fallback),
                         "fallback_rules": {
                             "relevance_score": fallback.relevance_score,
                             "importance_score": fallback.importance_score,
@@ -338,8 +422,7 @@ def deepseek_analyze(item: RawItem, fallback: Analysis) -> Analysis:
             },
         ],
         "stream": False,
-        "reasoning_effort": os.environ.get("DEEPSEEK_REASONING_EFFORT", "high"),
-        "thinking": {"type": "enabled"},
+        "reasoning_effort": os.environ.get("DEEPSEEK_REASONING_EFFORT", "low"),
         "response_format": {"type": "json_object"},
     }
     request = urllib.request.Request(
@@ -351,16 +434,188 @@ def deepseek_analyze(item: RawItem, fallback: Analysis) -> Analysis:
         },
         method="POST",
     )
+    timeout = _env_int("DEEPSEEK_TIMEOUT_SECONDS", 30)
     try:
-        with urllib.request.urlopen(request, timeout=45) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             response_body = response.read().decode("utf-8", errors="replace")
         data = json.loads(response_body)
         content = data["choices"][0]["message"]["content"]
         parsed = _extract_json(content)
         return Analysis.from_dict(parsed, provider="deepseek")
-    except (urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError, ValueError) as exc:
+    except (urllib.error.URLError, OSError, http.client.IncompleteRead, KeyError, IndexError, json.JSONDecodeError, ValueError) as exc:
         fallback.reasons = [*fallback.reasons, f"deepseek_fallback:{type(exc).__name__}"]
         return fallback
+
+
+def deepseek_brief_summary(item: RawItem, analysis: Analysis, limit: int = 50) -> str:
+    fallback = _brief_summary_fallback(item, analysis, limit)
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    if not api_key:
+        return fallback
+
+    base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
+    endpoint = f"{base_url}/chat/completions"
+    timeout = _env_int("DEEPSEEK_FEISHU_SUMMARY_TIMEOUT_SECONDS", 15)
+    request_attempts = max(1, _env_int("DEEPSEEK_FEISHU_SUMMARY_ATTEMPTS", 5))
+    previous_summary = None
+    for _ in range(2):
+        payload = _brief_summary_payload(model, item, analysis, limit, previous_summary)
+        summary = ""
+        for attempt in range(request_attempts):
+            request = urllib.request.Request(
+                endpoint,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    response_body = response.read().decode("utf-8", errors="replace")
+                data = json.loads(response_body)
+                content = data["choices"][0]["message"]["content"]
+                parsed = _extract_json(content)
+                summary = str(parsed.get("summary", "")).strip()
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code not in {408, 429, 500, 502, 503, 504} or attempt == request_attempts - 1:
+                    return fallback
+            except (urllib.error.URLError, OSError, http.client.IncompleteRead):
+                if attempt == request_attempts - 1:
+                    return fallback
+            except (KeyError, IndexError, json.JSONDecodeError, ValueError):
+                return fallback
+
+        if _is_valid_brief_summary(summary, limit):
+            return _normalize_spaces(summary)
+        if summary:
+            previous_summary = _normalize_spaces(summary)
+
+    return fallback
+
+
+def _brief_summary_fallback(item: RawItem, analysis: Analysis, limit: int) -> str:
+    text = analysis.summary.strip() or item.summary.strip() or item.raw_text.strip() or item.title.strip()
+    clean = _normalize_spaces(text)
+    if _is_valid_brief_summary(clean, limit):
+        return clean
+    return BRIEF_SUMMARY_FAILURE_FALLBACK
+
+
+def _brief_summary_payload(
+    model: str,
+    item: RawItem,
+    analysis: Analysis,
+    limit: int,
+    previous_summary: str | None = None,
+) -> dict[str, object]:
+    instruction = (
+        "你是新闻编辑。请把输入资讯翻译/压缩成中文新闻摘要，"
+        f"严格不超过{limit}个中文字符，只写事实，不要营销语，不要输出链接。"
+        "如果标题或正文是英文，必须翻译成中文。摘要必须是完整短句，不能截断半句话或半个词。"
+        "只概括 title 对应的当前文章，忽略网页导航、页脚、相关文章、推荐卡片和其它文章标题。"
+        "只输出 JSON object，字段为 summary。"
+    )
+    if previous_summary:
+        instruction += f"上一版摘要不合规：{previous_summary}。请重新写一条完整中文短句，严格不超过{limit}字。"
+    return {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": instruction},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "title": item.title,
+                        "source": item.source_name,
+                        "published_at": item.published_at,
+                        "previous_summary": previous_summary,
+                        "text": _brief_context(item, limit=900),
+                        "output_schema": {"summary": f"中文摘要，不超过{limit}字"},
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+        "stream": False,
+        "reasoning_effort": os.environ.get("DEEPSEEK_REASONING_EFFORT", "low"),
+        "response_format": {"type": "json_object"},
+    }
+
+
+def _is_valid_brief_summary(text: str, limit: int) -> bool:
+    clean = _normalize_spaces(text)
+    return bool(clean and len(clean) <= limit and _contains_cjk(clean))
+
+
+def _contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+
+def _normalize_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _keyword_context(item: RawItem, fallback: Analysis, limit: int | None = None) -> str:
+    budget = limit or _env_int("DEEPSEEK_CONTEXT_CHARS", 1800)
+    raw_text = item.raw_text or item.summary or item.title
+    clean = re.sub(r"\s+", " ", raw_text).strip()
+    if len(clean) <= budget:
+        return clean
+
+    terms = [term for term in fallback.reasons if term]
+    terms.extend(term for term in _effective_keyword_weights(item) if term in clean.lower())
+    snippets: list[str] = []
+    lower = clean.lower()
+    for term in terms[:12]:
+        index = lower.find(term.lower())
+        if index < 0:
+            continue
+        start = max(0, index - 160)
+        end = min(len(clean), index + len(term) + 260)
+        snippet = clean[start:end].strip()
+        if snippet and snippet not in snippets:
+            snippets.append(snippet)
+        if len(" ... ".join(snippets)) >= budget:
+            break
+    if snippets:
+        return _sentence(" ... ".join(snippets), budget)
+    return _sentence(clean, budget)
+
+
+def _brief_context(item: RawItem, limit: int = 900) -> str:
+    raw_text = item.raw_text or item.summary or item.title
+    clean = re.sub(r"\s+", " ", raw_text).strip()
+    title = re.sub(r"\s+", " ", item.title or "").strip()
+    if not clean:
+        return title
+    if len(title) >= 8:
+        lower = clean.lower()
+        needle = title.lower()
+        positions: list[int] = []
+        start = 0
+        while True:
+            index = lower.find(needle, start)
+            if index < 0:
+                break
+            positions.append(index)
+            start = index + 1
+        late_positions = [index for index in positions if index > 500]
+        if late_positions:
+            return _sentence(clean[late_positions[-1] :], limit)
+        if positions:
+            return _sentence(clean[positions[0] :], limit)
+    return _sentence(clean, limit)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -379,8 +634,66 @@ def _extract_json(text: str) -> dict[str, Any]:
     return parsed
 
 
+def _effective_keyword_weights(item: RawItem) -> dict[str, int]:
+    weights = dict(KEYWORD_WEIGHTS)
+    category = getattr(item, "source_category", "").lower()
+    for term, bonus in SOURCE_CATEGORY_WEIGHTS.get(category, {}).items():
+        normalized = term.lower()
+        weights[normalized] = weights.get(normalized, 0) + bonus
+    return weights
+
+
+def _apply_extraction_score_adjustment(score: int, item: RawItem) -> int:
+    method = getattr(item, "extraction_method", "record")
+    if method == "web_page":
+        return int(score * 0.65)
+    if method in {"listing_item", "api_item", "feed_item"}:
+        return min(100, score + 4)
+    return score
+
+
+def _source_importance_bonus(item: RawItem, haystack: str) -> int:
+    category = getattr(item, "source_category", "").lower()
+    if category == "regulator" and any(term in haystack for term in ["enforcement", "license", "licence", "consultation", "framework"]):
+        return 10
+    if category == "cex" and any(term in haystack for term in ["new listing", "delisting", "api update", "proof of reserve", "proof of reserves"]):
+        return 8
+    if category.startswith("rwa") and any(term in haystack for term in ["tokenized securities", "tokenized fund", "tokenized stocks", "digital securities"]):
+        return 10
+    return 0
+
+
+def _confidence_for(relevance: int, item: RawItem) -> float:
+    base = 0.55 if relevance else 0.25
+    method = getattr(item, "extraction_method", "record")
+    base += EXTRACTION_CONFIDENCE_ADJUSTMENTS.get(method, 0.0)
+    if getattr(item, "source_category", "") in {"regulator", "cex", "rwa-project", "rwa-infrastructure", "rwa-data"}:
+        base += 0.04
+    return max(0.1, min(0.9, round(base, 3)))
+
+
+def _analysis_reasons(matched: list[str], item: RawItem) -> list[str]:
+    reasons = matched[:12]
+    category = getattr(item, "source_category", "")
+    method = getattr(item, "extraction_method", "")
+    if category and category != "news":
+        reasons.append(f"source_category:{category}")
+    if method and method != "record":
+        reasons.append(f"extraction:{method}")
+    return reasons
+
+
 def _haystack(item: RawItem) -> str:
-    return " ".join([item.title, item.summary, item.raw_text, item.source_name]).lower()
+    return " ".join(
+        [
+            item.title,
+            item.summary,
+            item.raw_text,
+            item.source_name,
+            getattr(item, "source_category", ""),
+            getattr(item, "extraction_method", ""),
+        ]
+    ).lower()
 
 
 def _classify(mapping: dict[str, list[str]], haystack: str) -> list[str]:

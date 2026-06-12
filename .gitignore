@@ -15,4 +15,3 @@ venv/
 
 data/*.json
 !data/.gitkeep
-.rwa_intel/

@@ -1,14 +1,16 @@
 # crypto_rss
 
-Crypto / Web3 / RWA intelligence pipeline for collecting official RSS/API/web sources, ranking business-impactful signals, pushing a Lark/Feishu daily brief, and writing Markdown records into Obsidian.
+Crypto / Web3 / RWA intelligence pipeline for collecting official RSS/API/web sources, storing records in Supabase, ranking business-impactful signals, and pushing a Lark/Feishu alert brief.
 
 ```text
 RSS/API/web/announcements
   -> collect
-  -> dedupe + rule filter
-  -> DeepSeek or heuristic structured analysis
-  -> daily Top 10 Feishu intelligence brief
-  -> Obsidian Markdown + Bases/tags/project pages
+  -> stable item_hash
+  -> Supabase collected records
+  -> rule filter + DeepSeek or heuristic structured analysis
+  -> Supabase status/analysis updates
+  -> daily Top 10 Feishu alert brief
+  -> internal dashboard reads Supabase
 ```
 
 Default sources include major regulators, CEX announcement pages, and DEX/DeFi governance or blog sources. See [RWA_INTEL_MVP.md](RWA_INTEL_MVP.md) for the full source model.
@@ -40,7 +42,17 @@ Keep real credentials in your shell or a local ignored env file:
 export FEISHU_WEBHOOK_URL="https://open.feishu.cn/open-apis/bot/v2/hook/..."
 export DEEPSEEK_API_KEY="..."
 export DEEPSEEK_BASE_URL="https://api.deepseek.com"
-export DEEPSEEK_MODEL="deepseek-v4-pro"
+export DEEPSEEK_MODEL="deepseek-v4-flash"
+export DEEPSEEK_REASONING_EFFORT="low"
+export DEEPSEEK_TIMEOUT_SECONDS="30"
+export DEEPSEEK_CONTEXT_CHARS="1800"
+export DEEPSEEK_TOP_K="30"
+export DEEPSEEK_WORKERS="4"
+export SUPABASE_URL="https://PROJECT_REF.supabase.co"
+export SUPABASE_SECRET_KEY="..."
+export SUPABASE_TABLE="crypto_intel_items"
+export DASHBOARD_HOST="127.0.0.1"
+export DASHBOARD_PORT="8765"
 ```
 
 `DEEPSEEK_API_KEY` is optional. Without it, the MVP uses deterministic heuristic analysis.
@@ -54,7 +66,7 @@ List enabled sources:
 crypto-rss list-sources
 ```
 
-Preview the full pipeline without state writes or Feishu posts:
+Preview the full pipeline without Supabase writes or Feishu posts:
 
 ```bash
 crypto-rss run --dry-run
@@ -84,23 +96,41 @@ Send a Feishu connectivity test:
 crypto-rss send-test
 ```
 
-Run the live high-value alert pipeline:
+Run the live pipeline. This writes collected/analyzed records into Supabase and sends only new high-value alerts to Feishu:
 
 ```bash
 crypto-rss run --use-deepseek --min-score 70
 ```
 
-Write the same selected intelligence into Obsidian vault `Evolution`, folder `crypto`:
+Run without Feishu when you only want to update Supabase:
 
 ```bash
-crypto-rss run --use-deepseek --write-obsidian --no-feishu --min-score 70
+crypto-rss run --use-deepseek --no-feishu --min-score 70
 ```
 
-Test Obsidian writing only:
+Before the first live run, execute [supabase/schema.sql](supabase/schema.sql) in the Supabase SQL Editor. The CLI upserts by `item_hash`, so repeated runs update existing records instead of creating duplicates.
+
+Use `--reanalyze-seen --no-feishu` when you want DeepSeek to refresh records already present in Supabase without resending old Feishu alerts:
 
 ```bash
-crypto-rss obsidian-test
+crypto-rss run --use-deepseek --reanalyze-seen --no-feishu --deepseek-top-k 30 --min-score 70
 ```
+
+Use `--include-seen` only when you intentionally want to reprocess records already present in Supabase and allow duplicate Feishu sends.
+
+Open the local Supabase-backed dashboard:
+
+```bash
+crypto-rss dashboard
+```
+
+The dashboard server reads Supabase with your backend-only key and serves a browser page at `http://127.0.0.1:8765`. Do not put the service key into a static frontend.
+
+For shared review in Supabase, open the compact `crypto_intel_today` view. It shows only `name`, `source`, `importance`, `projects`, and `asset_classes`; the wider `crypto_intel_items` table keeps internal pipeline fields for dedupe, status, and alert delivery.
+
+## Source Extraction
+
+`rss` and `api` sources produce one item per feed/API record. `web` and `announcement` sources now try to extract same-site article or announcement links first, so exchange listing pages are stored as individual records instead of one noisy homepage record. If a source needs tighter filtering, add `link_selector`, `link_include`, or `link_exclude` in `rwa_intel_mvp/default_sources.json`.
 
 ## Documentation
 
