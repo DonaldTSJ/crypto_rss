@@ -118,6 +118,22 @@ crypto-rss run --use-deepseek --reanalyze-seen --no-feishu --deepseek-top-k 30 -
 
 Use `--include-seen` only when you intentionally want to reprocess records already present in Supabase and allow duplicate Feishu sends.
 
+Run a local terminal scheduler that keeps this project alive and sends the daily brief at 16:00 local time:
+
+```bash
+crypto-rss schedule
+```
+
+For this Windows workspace, use the portable Python command if the installed console script is unavailable:
+
+```powershell
+$env:PYTHONIOENCODING='utf-8'
+$py = "$env:TEMP\codex-python-3.12.4-embed-amd64\python.exe"
+& $py -c "import sys; sys.path.insert(0, r'D:\AI_Codex\Crypto\Crypto Newletter\crypto_rss'); from rwa_intel_mvp.cli import main; raise SystemExit(main(['schedule']))"
+```
+
+The scheduler defaults to the production-safe daily command: DeepSeek on, `--reanalyze-seen`, Top 10, minimum score 70, and today's article dates only. Use `crypto-rss schedule --once` to test one scheduled run and exit. This is a local terminal scheduler, so the task pauses if the computer sleeps or the terminal is closed.
+
 Open the local Supabase-backed dashboard:
 
 ```bash

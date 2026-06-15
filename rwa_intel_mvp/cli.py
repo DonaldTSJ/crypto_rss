@@ -4,9 +4,10 @@ import argparse
 import json
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 
 from .analyzer import deepseek_analyze, deepseek_brief_summary, heuristic_analyze, passes_rule_filter
@@ -45,6 +46,8 @@ def main(argv: list[str] | None = None) -> int:
         return send_test(args)
     if args.command == "dashboard":
         return dashboard(args)
+    if args.command == "schedule":
+        return schedule(args)
     if args.command == "run":
         return run_pipeline(args)
 
@@ -104,6 +107,25 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard_parser.add_argument("--supabase-key", default=_supabase_key_from_env())
     dashboard_parser.add_argument("--supabase-table", default=os.environ.get("SUPABASE_TABLE", DEFAULT_SUPABASE_TABLE))
 
+    schedule_parser = subparsers.add_parser("schedule", help="run the production pipeline daily in this terminal")
+    schedule_parser.add_argument("--time", default="16:00", help="local wall-clock time in HH:MM, default 16:00")
+    schedule_parser.add_argument("--sources", default=str(DEFAULT_SOURCES_PATH), help="JSON source config path")
+    schedule_parser.add_argument("--limit-per-source", type=int, default=8)
+    schedule_parser.add_argument("--min-score", type=int, default=70)
+    schedule_parser.add_argument("--top-n", type=int, default=10)
+    schedule_parser.add_argument("--all-dates", action="store_true", help="include dated items outside today's local date")
+    schedule_parser.add_argument("--deepseek-top-k", type=int, default=_env_int("DEEPSEEK_TOP_K", 30))
+    schedule_parser.add_argument("--deepseek-workers", type=int, default=_env_int("DEEPSEEK_WORKERS", 4))
+    schedule_parser.add_argument("--no-rule-filter", action="store_true", help="analyze all collected items")
+    schedule_parser.add_argument("--no-supabase", action="store_true", help="skip Supabase writes for local debugging")
+    schedule_parser.add_argument("--no-feishu", action="store_true", help="skip Feishu sending after processing")
+    schedule_parser.add_argument("--supabase-url", default=os.environ.get("SUPABASE_URL"))
+    schedule_parser.add_argument("--supabase-key", default=_supabase_key_from_env())
+    schedule_parser.add_argument("--supabase-table", default=os.environ.get("SUPABASE_TABLE", DEFAULT_SUPABASE_TABLE))
+    schedule_parser.add_argument("--webhook-url", default=os.environ.get("FEISHU_WEBHOOK_URL"))
+    schedule_parser.add_argument("--run-on-start", action="store_true", help="run once immediately, then continue daily")
+    schedule_parser.add_argument("--once", action="store_true", help="run once with the scheduled production defaults and exit")
+
     list_parser = subparsers.add_parser("list-sources", help="print enabled sources")
     list_parser.add_argument("--sources", default=str(DEFAULT_SOURCES_PATH))
     return parser
@@ -142,6 +164,93 @@ def dashboard(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 1
     return 0
+
+
+def schedule(args: argparse.Namespace) -> int:
+    try:
+        hour, minute = _parse_schedule_time(args.time)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    if args.once:
+        return run_pipeline(_scheduled_run_args(args))
+
+    print(
+        json.dumps(
+            {
+                "scheduler": "daily",
+                "time": f"{hour:02d}:{minute:02d}",
+                "timezone": datetime.now().astimezone().tzname(),
+                "run_on_start": args.run_on_start,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+    if args.run_on_start:
+        run_pipeline(_scheduled_run_args(args))
+
+    while True:
+        next_run = _next_daily_run(hour, minute)
+        wait_seconds = max(1, int((next_run - datetime.now().astimezone()).total_seconds()))
+        print(f"Next scheduled run: {next_run.isoformat()}")
+        try:
+            time.sleep(wait_seconds)
+            code = run_pipeline(_scheduled_run_args(args))
+            if code:
+                print(f"Scheduled run exited with code {code}; waiting for the next day.", file=sys.stderr)
+        except KeyboardInterrupt:
+            print("\nScheduler stopped.")
+            return 0
+        except Exception as exc:  # noqa: BLE001 - local scheduler should keep the next daily run alive.
+            print(f"Scheduled run failed: {exc}", file=sys.stderr)
+
+
+def _scheduled_run_args(args: argparse.Namespace) -> argparse.Namespace:
+    return argparse.Namespace(
+        command="run",
+        sources=args.sources,
+        limit_per_source=args.limit_per_source,
+        min_score=args.min_score,
+        top_n=args.top_n,
+        all_dates=args.all_dates,
+        dry_run=False,
+        include_seen=False,
+        reanalyze_seen=True,
+        use_deepseek=True,
+        deepseek_top_k=args.deepseek_top_k,
+        deepseek_workers=args.deepseek_workers,
+        no_rule_filter=args.no_rule_filter,
+        no_supabase=args.no_supabase,
+        no_feishu=args.no_feishu,
+        supabase_url=args.supabase_url,
+        supabase_key=args.supabase_key,
+        supabase_table=args.supabase_table,
+        webhook_url=args.webhook_url,
+    )
+
+
+def _parse_schedule_time(value: str) -> tuple[int, int]:
+    parts = value.strip().split(":")
+    if len(parts) != 2:
+        raise ValueError("--time must use HH:MM format.")
+    try:
+        hour, minute = (int(part) for part in parts)
+    except ValueError as exc:
+        raise ValueError("--time must use HH:MM format.") from exc
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("--time must be a valid local time between 00:00 and 23:59.")
+    return hour, minute
+
+
+def _next_daily_run(hour: int, minute: int, now: datetime | None = None) -> datetime:
+    local_now = now.astimezone() if now else datetime.now().astimezone()
+    candidate = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= local_now:
+        candidate += timedelta(days=1)
+    return candidate
 
 
 def run_pipeline(args: argparse.Namespace) -> int:
@@ -229,7 +338,13 @@ def run_pipeline(args: argparse.Namespace) -> int:
             )
 
         alerts_in_message = rank_alert_items(selected_to_send)[: args.top_n]
-        alert_message_items = _with_feishu_summaries(alerts_in_message, args)
+        analyzed_in_message = rank_alert_items(analyzed_items)[: args.top_n]
+        selected_in_message = rank_alert_items(selected)[: args.top_n]
+        if args.reanalyze_seen and analyzed_in_message:
+            card_source_items = analyzed_in_message
+        else:
+            card_source_items = alerts_in_message or selected_in_message
+        alert_message_items = _with_feishu_summaries(card_source_items, args)
         message = format_alert(alert_message_items, source_errors=source_errors, max_items=args.top_n)
         summary = {
             "collected": collected_count,
@@ -238,6 +353,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             "selected": len(selected),
             "selected_to_send": len(selected_to_send),
             "alerts_to_send": len(alerts_in_message),
+            "card_items": len(card_source_items),
             "skipped_seen": skipped_seen,
             "skipped_rule": skipped_rule,
             "skipped_date": skipped_date,
@@ -261,9 +377,9 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
         if args.dry_run:
             return 0
-        if alerts_in_message and not args.no_feishu:
+        if not args.no_feishu:
             if not args.webhook_url:
-                print("FEISHU_WEBHOOK_URL is required to send alerts.", file=sys.stderr)
+                print("FEISHU_WEBHOOK_URL is required to send the Feishu card.", file=sys.stderr)
                 return 2
             send_text(
                 args.webhook_url,
@@ -274,14 +390,17 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     max_items=args.top_n,
                 ),
             )
-            if use_supabase:
+            if alerts_in_message and use_supabase:
                 mark_alert_sent(
                     alerts_in_message,
                     supabase_url=args.supabase_url,
                     supabase_key=args.supabase_key,
                     table=args.supabase_table,
                 )
-            print("Feishu alert sent.")
+            if alerts_in_message:
+                print("Feishu alert sent.")
+            else:
+                print("Feishu summary card sent.")
         return 0
     except (FeishuError, SupabaseError, OSError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

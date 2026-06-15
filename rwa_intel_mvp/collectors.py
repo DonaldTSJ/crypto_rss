@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from html import unescape
 from html.parser import HTMLParser
 from typing import Any
@@ -255,9 +256,22 @@ def collect_rss(source: Source, limit: int = 10) -> list[RawItem]:
                 "{http://www.w3.org/2005/Atom}content",
             ],
         )
-        published_at = _first_text(
-            entry,
-            ["pubDate", "published", "updated", "{http://www.w3.org/2005/Atom}updated"],
+        published_at = _rss_published_at(
+            _first_text(
+                entry,
+                [
+                    "pubDate",
+                    "published",
+                    "updated",
+                    "{http://www.w3.org/2005/Atom}published",
+                    "{http://www.w3.org/2005/Atom}updated",
+                    "{http://purl.org/dc/elements/1.1/}date",
+                    "{http://purl.org/dc/terms/}issued",
+                    "{http://purl.org/dc/terms/}created",
+                ],
+            ),
+            summary,
+            title,
         )
         text = strip_html(summary or "")
         output.append(
@@ -298,7 +312,7 @@ def build_listing_item(source: Source, link: LinkCandidate) -> RawItem:
     published_at = link.published_at
     try:
         detail_html = fetch_text(link.url, headers=source.headers)
-        detail_title = extract_title(detail_html)
+        detail_title = _clean_detail_title(extract_title(detail_html))
         if detail_title and _should_use_detail_title(title, detail_title):
             title = detail_title
         detail_text = strip_html(detail_html)
@@ -371,6 +385,16 @@ def extract_listing_links(html: str, source: Source, limit: int = 10) -> list[Li
         if len(output) >= limit:
             break
     return output
+
+
+def _rss_published_at(raw_date: str | None, summary_html: str | None, title: str) -> str | None:
+    if raw_date:
+        normalized = _normalize_published_date(raw_date)
+        if normalized:
+            return normalized
+    if summary_html:
+        return extract_published_at(summary_html, strip_html(summary_html), title)
+    return None
 
 
 def collect_api(source: Source, limit: int = 10) -> list[RawItem]:
@@ -535,10 +559,12 @@ def _visible_date_candidates(text: str) -> list[str]:
         "Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
     )
     patterns = [
+        r"\b\d{1,2}/\d{1,2}/\d{4},\s*\d{1,2}:\d{2}(?::\d{2})?\b",
         rf"\b(?:{month_names})\s+\d{{1,2}},\s+\d{{4}}\b",
         rf"\b\d{{1,2}}\s+(?:{month_names})\s+\d{{4}}\b",
         r"\b\d{4}-\d{2}-\d{2}\b",
         r"\b\d{4}/\d{1,2}/\d{1,2}\b",
+        r"\b\d{1,2}/\d{1,2}/\d{4}\b",
         r"\b\d{1,2}\.\d{1,2}\.\d{4}\b",
     ]
     for pattern in patterns:
@@ -559,9 +585,23 @@ def _normalize_published_date(value: str) -> str | None:
             return datetime.strptime(text, fmt).date().isoformat()
         except ValueError:
             continue
+    try:
+        return parsedate_to_datetime(text).isoformat()
+    except (TypeError, ValueError, IndexError, OverflowError):
+        pass
     slash_match = re.match(r"^(\d{4})/(\d{1,2})/(\d{1,2})$", text)
     if slash_match:
         year, month, day = (int(part) for part in slash_match.groups())
+        try:
+            return datetime(year, month, day).date().isoformat()
+        except ValueError:
+            return None
+    us_slash_match = re.match(
+        r"^(?:[A-Za-z]{3},\s*)?(\d{1,2})/(\d{1,2})/(\d{4})(?:\s*(?:-|,)\s*\d{1,2}:\d{2}(?::\d{2})?)?$",
+        text,
+    )
+    if us_slash_match:
+        month, day, year = (int(part) for part in us_slash_match.groups())
         try:
             return datetime(year, month, day).date().isoformat()
         except ValueError:
@@ -735,7 +775,20 @@ def _should_use_detail_title(current_title: str, detail_title: str) -> bool:
         return True
     if current.lower() in LOW_VALUE_LINK_TITLES:
         return True
+    if len(detail) < len(current) and detail.lower() in current.lower():
+        return True
     return False
+
+
+def _clean_detail_title(title: str | None) -> str | None:
+    if not title:
+        return None
+    clean = re.sub(r"\s+", " ", title).strip()
+    if "|" in clean:
+        left, right = clean.rsplit("|", 1)
+        if len(left.strip()) >= 6 and 0 < len(right.strip()) <= 40:
+            return left.strip()
+    return clean
 
 
 def _matches_link_selector(link: LinkCandidate, selector: str) -> bool:
