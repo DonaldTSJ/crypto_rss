@@ -4,19 +4,38 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
+from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
-from pathlib import Path
 
-from .analyzer import analyze_item, passes_rule_filter
+from .analyzer import deepseek_analyze, deepseek_brief_summary, heuristic_analyze, passes_rule_filter
 from .collectors import collect_sources
 from .config import DEFAULT_SOURCES_PATH, load_local_env, load_sources
-from .feishu import FeishuError, format_alert, send_text
-from .obsidian import DEFAULT_OUTPUT_DIR, DEFAULT_VAULT_NAME, write_obsidian_markdown, write_obsidian_smoke_test
-from .storage import DEFAULT_DB_PATH, StateStore
+from .dashboard import DEFAULT_DASHBOARD_HOST, DEFAULT_DASHBOARD_PORT, run_dashboard
+from .feishu import FeishuError, build_alert_interactive_payload, format_alert, rank_alert_items, send_text
+from .models import Analysis, RawItem, item_hash
+from .supabase import (
+    DEFAULT_SUPABASE_TABLE,
+    STATUS_ANALYZED,
+    STATUS_SELECTED,
+    STATUS_SENT,
+    STATUS_SKIPPED_DATE,
+    STATUS_SKIPPED_RULE,
+    SupabaseError,
+    already_alerted,
+    fetch_item_states,
+    mark_alert_sent,
+    should_skip_seen,
+    upsert_analysis_items,
+    upsert_collected_items,
+    upsert_status_items,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_stdio()
     load_local_env()
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -25,13 +44,22 @@ def main(argv: list[str] | None = None) -> int:
         return list_sources(args)
     if args.command == "send-test":
         return send_test(args)
-    if args.command == "obsidian-test":
-        return obsidian_test(args)
+    if args.command == "dashboard":
+        return dashboard(args)
+    if args.command == "schedule":
+        return schedule(args)
     if args.command == "run":
         return run_pipeline(args)
 
     parser.print_help()
     return 2
+
+
+def _configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,20 +68,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run", help="collect, filter, analyze, and optionally push alerts")
     run.add_argument("--sources", default=str(DEFAULT_SOURCES_PATH), help="JSON source config path")
-    run.add_argument("--db", default=str(DEFAULT_DB_PATH), help="SQLite state path")
     run.add_argument("--limit-per-source", type=int, default=8)
     run.add_argument("--min-score", type=int, default=70)
     run.add_argument("--top-n", type=int, default=10, help="maximum items in the final daily brief")
     run.add_argument("--all-dates", action="store_true", help="include dated items outside today's local date")
-    run.add_argument("--dry-run", action="store_true", help="print payload without writing state or sending Feishu")
-    run.add_argument("--include-seen", action="store_true", help="process items already present in state DB")
+    run.add_argument("--dry-run", action="store_true", help="print payload without writing Supabase or sending Feishu")
+    run.add_argument(
+        "--include-seen",
+        action="store_true",
+        help="reprocess items already present in Supabase and allow duplicate Feishu sends",
+    )
+    run.add_argument(
+        "--reanalyze-seen",
+        action="store_true",
+        help="reanalyze items already present in Supabase without resending already-alerted items",
+    )
     run.add_argument("--use-deepseek", action="store_true", help="use DeepSeek when DEEPSEEK_API_KEY is set")
+    run.add_argument("--deepseek-top-k", type=int, default=_env_int("DEEPSEEK_TOP_K", 30))
+    run.add_argument("--deepseek-workers", type=int, default=_env_int("DEEPSEEK_WORKERS", 4))
     run.add_argument("--no-rule-filter", action="store_true", help="analyze all collected items")
-    run.add_argument("--write-obsidian", action="store_true", help="write selected items into Obsidian Markdown")
+    run.add_argument("--no-supabase", action="store_true", help="skip Supabase writes for local debugging")
     run.add_argument("--no-feishu", action="store_true", help="skip Feishu sending after processing")
-    run.add_argument("--obsidian-vault", default=os.environ.get("OBSIDIAN_VAULT_NAME", DEFAULT_VAULT_NAME))
-    run.add_argument("--obsidian-vault-path", default=os.environ.get("OBSIDIAN_VAULT_PATH"))
-    run.add_argument("--obsidian-dir", default=os.environ.get("OBSIDIAN_OUTPUT_DIR", DEFAULT_OUTPUT_DIR))
+    run.add_argument("--supabase-url", default=os.environ.get("SUPABASE_URL"))
+    run.add_argument("--supabase-key", default=_supabase_key_from_env())
+    run.add_argument("--supabase-table", default=os.environ.get("SUPABASE_TABLE", DEFAULT_SUPABASE_TABLE))
     run.add_argument("--webhook-url", default=os.environ.get("FEISHU_WEBHOOK_URL"))
 
     test = subparsers.add_parser("send-test", help="send a simple Feishu webhook test")
@@ -61,10 +99,32 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("--text", default="RWA Intel MVP 测试消息：飞书机器人已连通。")
     test.add_argument("--dry-run", action="store_true")
 
-    obsidian = subparsers.add_parser("obsidian-test", help="write and verify a small Obsidian test note")
-    obsidian.add_argument("--obsidian-vault", default=os.environ.get("OBSIDIAN_VAULT_NAME", DEFAULT_VAULT_NAME))
-    obsidian.add_argument("--obsidian-vault-path", default=os.environ.get("OBSIDIAN_VAULT_PATH"))
-    obsidian.add_argument("--obsidian-dir", default=os.environ.get("OBSIDIAN_OUTPUT_DIR", DEFAULT_OUTPUT_DIR))
+    dashboard_parser = subparsers.add_parser("dashboard", help="serve a Supabase-backed local intelligence dashboard")
+    dashboard_parser.add_argument("--host", default=os.environ.get("DASHBOARD_HOST", DEFAULT_DASHBOARD_HOST))
+    dashboard_parser.add_argument("--port", type=int, default=int(os.environ.get("DASHBOARD_PORT", DEFAULT_DASHBOARD_PORT)))
+    dashboard_parser.add_argument("--no-open", action="store_true", help="do not open the browser automatically")
+    dashboard_parser.add_argument("--supabase-url", default=os.environ.get("SUPABASE_URL"))
+    dashboard_parser.add_argument("--supabase-key", default=_supabase_key_from_env())
+    dashboard_parser.add_argument("--supabase-table", default=os.environ.get("SUPABASE_TABLE", DEFAULT_SUPABASE_TABLE))
+
+    schedule_parser = subparsers.add_parser("schedule", help="run the production pipeline daily in this terminal")
+    schedule_parser.add_argument("--time", default="16:00", help="local wall-clock time in HH:MM, default 16:00")
+    schedule_parser.add_argument("--sources", default=str(DEFAULT_SOURCES_PATH), help="JSON source config path")
+    schedule_parser.add_argument("--limit-per-source", type=int, default=8)
+    schedule_parser.add_argument("--min-score", type=int, default=70)
+    schedule_parser.add_argument("--top-n", type=int, default=10)
+    schedule_parser.add_argument("--all-dates", action="store_true", help="include dated items outside today's local date")
+    schedule_parser.add_argument("--deepseek-top-k", type=int, default=_env_int("DEEPSEEK_TOP_K", 30))
+    schedule_parser.add_argument("--deepseek-workers", type=int, default=_env_int("DEEPSEEK_WORKERS", 4))
+    schedule_parser.add_argument("--no-rule-filter", action="store_true", help="analyze all collected items")
+    schedule_parser.add_argument("--no-supabase", action="store_true", help="skip Supabase writes for local debugging")
+    schedule_parser.add_argument("--no-feishu", action="store_true", help="skip Feishu sending after processing")
+    schedule_parser.add_argument("--supabase-url", default=os.environ.get("SUPABASE_URL"))
+    schedule_parser.add_argument("--supabase-key", default=_supabase_key_from_env())
+    schedule_parser.add_argument("--supabase-table", default=os.environ.get("SUPABASE_TABLE", DEFAULT_SUPABASE_TABLE))
+    schedule_parser.add_argument("--webhook-url", default=os.environ.get("FEISHU_WEBHOOK_URL"))
+    schedule_parser.add_argument("--run-on-start", action="store_true", help="run once immediately, then continue daily")
+    schedule_parser.add_argument("--once", action="store_true", help="run once with the scheduled production defaults and exit")
 
     list_parser = subparsers.add_parser("list-sources", help="print enabled sources")
     list_parser.add_argument("--sources", default=str(DEFAULT_SOURCES_PATH))
@@ -90,70 +150,226 @@ def send_test(args: argparse.Namespace) -> int:
     return 0
 
 
-def obsidian_test(args: argparse.Namespace) -> int:
-    path = write_obsidian_smoke_test(
-        vault_name=args.obsidian_vault,
-        vault_path=args.obsidian_vault_path,
-        output_dir=args.obsidian_dir,
-    )
-    print(json.dumps({"obsidian_test_note": str(path)}, ensure_ascii=False, indent=2))
+def dashboard(args: argparse.Namespace) -> int:
+    try:
+        run_dashboard(
+            host=args.host,
+            port=args.port,
+            supabase_url=args.supabase_url,
+            supabase_key=args.supabase_key,
+            table=args.supabase_table,
+            open_browser=not args.no_open,
+        )
+    except (OSError, SupabaseError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     return 0
+
+
+def schedule(args: argparse.Namespace) -> int:
+    try:
+        hour, minute = _parse_schedule_time(args.time)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    if args.once:
+        return run_pipeline(_scheduled_run_args(args))
+
+    print(
+        json.dumps(
+            {
+                "scheduler": "daily",
+                "time": f"{hour:02d}:{minute:02d}",
+                "timezone": datetime.now().astimezone().tzname(),
+                "run_on_start": args.run_on_start,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+    if args.run_on_start:
+        run_pipeline(_scheduled_run_args(args))
+
+    while True:
+        next_run = _next_daily_run(hour, minute)
+        wait_seconds = max(1, int((next_run - datetime.now().astimezone()).total_seconds()))
+        print(f"Next scheduled run: {next_run.isoformat()}")
+        try:
+            time.sleep(wait_seconds)
+            code = run_pipeline(_scheduled_run_args(args))
+            if code:
+                print(f"Scheduled run exited with code {code}; waiting for the next day.", file=sys.stderr)
+        except KeyboardInterrupt:
+            print("\nScheduler stopped.")
+            return 0
+        except Exception as exc:  # noqa: BLE001 - local scheduler should keep the next daily run alive.
+            print(f"Scheduled run failed: {exc}", file=sys.stderr)
+
+
+def _scheduled_run_args(args: argparse.Namespace) -> argparse.Namespace:
+    return argparse.Namespace(
+        command="run",
+        sources=args.sources,
+        limit_per_source=args.limit_per_source,
+        min_score=args.min_score,
+        top_n=args.top_n,
+        all_dates=args.all_dates,
+        dry_run=False,
+        include_seen=False,
+        reanalyze_seen=True,
+        use_deepseek=True,
+        deepseek_top_k=args.deepseek_top_k,
+        deepseek_workers=args.deepseek_workers,
+        no_rule_filter=args.no_rule_filter,
+        no_supabase=args.no_supabase,
+        no_feishu=args.no_feishu,
+        supabase_url=args.supabase_url,
+        supabase_key=args.supabase_key,
+        supabase_table=args.supabase_table,
+        webhook_url=args.webhook_url,
+    )
+
+
+def _parse_schedule_time(value: str) -> tuple[int, int]:
+    parts = value.strip().split(":")
+    if len(parts) != 2:
+        raise ValueError("--time must use HH:MM format.")
+    try:
+        hour, minute = (int(part) for part in parts)
+    except ValueError as exc:
+        raise ValueError("--time must use HH:MM format.") from exc
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("--time must be a valid local time between 00:00 and 23:59.")
+    return hour, minute
+
+
+def _next_daily_run(hour: int, minute: int, now: datetime | None = None) -> datetime:
+    local_now = now.astimezone() if now else datetime.now().astimezone()
+    candidate = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= local_now:
+        candidate += timedelta(days=1)
+    return candidate
 
 
 def run_pipeline(args: argparse.Namespace) -> int:
     sources = load_sources(args.sources)
     items, source_errors = collect_sources(sources, limit_per_source=args.limit_per_source)
-    store = None if args.dry_run else StateStore(args.db)
+    collected_count = len(items)
+    items = _dedupe_raw_items(items)
+    use_supabase = not args.dry_run and not args.no_supabase
+    item_states = {}
     selected = []
+    selected_to_send = []
+    skipped_date_items = []
+    skipped_rule_items = []
+    analysis_updates = []
     processed_count = 0
     skipped_seen = 0
     skipped_rule = 0
     skipped_date = 0
+    candidates: list[tuple[RawItem, Analysis]] = []
+    analysis_stats: dict[str, object] = {}
 
     try:
+        if use_supabase:
+            item_states = fetch_item_states(
+                items,
+                supabase_url=args.supabase_url,
+                supabase_key=args.supabase_key,
+                table=args.supabase_table,
+            )
+            upsert_collected_items(
+                items,
+                supabase_url=args.supabase_url,
+                supabase_key=args.supabase_key,
+                table=args.supabase_table,
+                existing_states=item_states,
+            )
+
         for item in items:
-            if store and not args.include_seen and store.has_seen(item):
+            if use_supabase and not args.include_seen and not args.reanalyze_seen and should_skip_seen(item, item_states):
                 skipped_seen += 1
                 continue
             if not args.all_dates and not _is_today_or_undated(item):
                 skipped_date += 1
-                if store:
-                    store.mark_seen(item)
+                skipped_date_items.append(item)
                 continue
             extra_keywords = _source_keywords(sources, item.source_name)
             if not args.no_rule_filter and not passes_rule_filter(item, extra_keywords):
                 skipped_rule += 1
-                if store:
-                    store.mark_seen(item)
+                skipped_rule_items.append(item)
                 continue
-            analysis = analyze_item(item, use_deepseek=args.use_deepseek)
-            processed_count += 1
-            if store:
-                store.mark_seen(item)
+            candidates.append((item, heuristic_analyze(item)))
+
+        analyzed_items, analysis_stats = _analyze_candidates(candidates, args)
+        processed_count = len(analyzed_items)
+        for item, analysis in analyzed_items:
             if analysis.alert_score >= args.min_score:
                 selected.append((item, analysis))
+                status = _analysis_status(item, analysis, args.min_score, item_states)
+                if args.include_seen or not already_alerted(item, item_states):
+                    selected_to_send.append((item, analysis))
+            else:
+                status = _analysis_status(item, analysis, args.min_score, item_states)
+            analysis_updates.append((item, analysis, status))
 
-        message = format_alert(selected, source_errors=source_errors, max_items=args.top_n)
-        obsidian_result = None
-        if args.write_obsidian and not args.dry_run:
-            obsidian_result = write_obsidian_markdown(
-                selected,
-                vault_name=args.obsidian_vault,
-                vault_path=args.obsidian_vault_path,
-                output_dir=args.obsidian_dir,
-                max_items=args.top_n,
+        if use_supabase:
+            upsert_status_items(
+                skipped_date_items,
+                STATUS_SKIPPED_DATE,
+                supabase_url=args.supabase_url,
+                supabase_key=args.supabase_key,
+                table=args.supabase_table,
             )
+            upsert_status_items(
+                skipped_rule_items,
+                STATUS_SKIPPED_RULE,
+                supabase_url=args.supabase_url,
+                supabase_key=args.supabase_key,
+                table=args.supabase_table,
+            )
+            upsert_analysis_items(
+                analysis_updates,
+                supabase_url=args.supabase_url,
+                supabase_key=args.supabase_key,
+                table=args.supabase_table,
+            )
+
+        alerts_in_message = rank_alert_items(selected_to_send)[: args.top_n]
+        analyzed_in_message = rank_alert_items(analyzed_items)[: args.top_n]
+        selected_in_message = rank_alert_items(selected)[: args.top_n]
+        if args.reanalyze_seen and analyzed_in_message:
+            card_source_items = analyzed_in_message
+        else:
+            card_source_items = alerts_in_message or selected_in_message
+        alert_message_items = _with_feishu_summaries(card_source_items, args)
+        message = format_alert(alert_message_items, source_errors=source_errors, max_items=args.top_n)
         summary = {
-            "collected": len(items),
+            "collected": collected_count,
+            "unique_collected": len(items),
             "processed": processed_count,
-            "alerts": len(selected),
+            "selected": len(selected),
+            "selected_to_send": len(selected_to_send),
+            "alerts_to_send": len(alerts_in_message),
+            "card_items": len(card_source_items),
             "skipped_seen": skipped_seen,
             "skipped_rule": skipped_rule,
             "skipped_date": skipped_date,
             "source_errors": source_errors,
             "dry_run": args.dry_run,
+            "reanalyze_seen": args.reanalyze_seen,
             "deepseek_enabled": bool(args.use_deepseek and os.environ.get("DEEPSEEK_API_KEY")),
-            "obsidian": obsidian_result.to_dict() if obsidian_result else ("dry_run_skipped" if args.write_obsidian else None),
+            "analysis": analysis_stats,
+            "supabase": {
+                "enabled": use_supabase,
+                "table": args.supabase_table if use_supabase else None,
+                "existing_items": len(item_states),
+                "collected_rows": len(items) if use_supabase else 0,
+                "status_rows": (len(skipped_date_items) + len(skipped_rule_items)) if use_supabase else 0,
+                "analysis_rows": len(analysis_updates) if use_supabase else 0,
+            },
         }
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         print("\n--- Feishu message preview ---\n")
@@ -161,23 +377,155 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
         if args.dry_run:
             return 0
-        if obsidian_result:
-            print("Obsidian Markdown written.")
-        if selected and not args.no_feishu:
+        if not args.no_feishu:
             if not args.webhook_url:
-                print("FEISHU_WEBHOOK_URL is required to send alerts.", file=sys.stderr)
+                print("FEISHU_WEBHOOK_URL is required to send the Feishu card.", file=sys.stderr)
                 return 2
-            send_text(args.webhook_url, message)
-            for item, analysis in selected:
-                store.mark_alert_sent(item, analysis)
-            print("Feishu alert sent.")
+            send_text(
+                args.webhook_url,
+                message,
+                payload=build_alert_interactive_payload(
+                    alert_message_items,
+                    source_errors=source_errors,
+                    max_items=args.top_n,
+                ),
+            )
+            if alerts_in_message and use_supabase:
+                mark_alert_sent(
+                    alerts_in_message,
+                    supabase_url=args.supabase_url,
+                    supabase_key=args.supabase_key,
+                    table=args.supabase_table,
+                )
+            if alerts_in_message:
+                print("Feishu alert sent.")
+            else:
+                print("Feishu summary card sent.")
         return 0
-    except (FeishuError, OSError, ValueError) as exc:
+    except (FeishuError, SupabaseError, OSError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    finally:
-        if store:
-            store.close()
+
+
+def _analyze_candidates(
+    candidates: list[tuple[RawItem, Analysis]],
+    args: argparse.Namespace,
+) -> tuple[list[tuple[RawItem, Analysis]], dict[str, object]]:
+    if not candidates:
+        return [], {
+            "deepseek_targets": 0,
+            "deepseek_successes": 0,
+            "deepseek_fallbacks": 0,
+            "deepseek_workers": 0,
+            "provider_counts": {},
+        }
+
+    use_deepseek = bool(args.use_deepseek and os.environ.get("DEEPSEEK_API_KEY"))
+    deepseek_model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash") if use_deepseek else None
+    deepseek_targets: set[str] = set()
+    if use_deepseek:
+        top_k = max(0, int(getattr(args, "deepseek_top_k", 30)))
+        ranked = sorted(candidates, key=lambda pair: pair[1].alert_score, reverse=True)
+        deepseek_targets = {item_hash(item) for item, _ in ranked[:top_k]}
+
+    if not deepseek_targets:
+        results = list(candidates)
+        return results, {
+            "deepseek_targets": 0,
+            "deepseek_successes": 0,
+            "deepseek_fallbacks": 0,
+            "deepseek_workers": 0,
+            "deepseek_model": deepseek_model,
+            "provider_counts": _provider_counts(results),
+        }
+
+    workers = max(1, min(int(getattr(args, "deepseek_workers", 4)), len(deepseek_targets)))
+    results: list[tuple[RawItem, Analysis] | None] = [None] * len(candidates)
+
+    def analyze_one(index: int, item: RawItem, fallback: Analysis) -> tuple[int, RawItem, Analysis]:
+        if item_hash(item) in deepseek_targets:
+            return index, item, deepseek_analyze(item, fallback)
+        return index, item, fallback
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(analyze_one, index, item, fallback)
+            for index, (item, fallback) in enumerate(candidates)
+        ]
+        for future in as_completed(futures):
+            index, item, analysis = future.result()
+            results[index] = (item, analysis)
+
+    analyzed = [result for result in results if result is not None]
+    deepseek_successes = sum(
+        1 for item, analysis in analyzed if item_hash(item) in deepseek_targets and analysis.provider == "deepseek"
+    )
+    return analyzed, {
+        "deepseek_targets": len(deepseek_targets),
+        "deepseek_successes": deepseek_successes,
+        "deepseek_fallbacks": len(deepseek_targets) - deepseek_successes,
+        "deepseek_workers": workers,
+        "deepseek_model": deepseek_model,
+        "provider_counts": _provider_counts(analyzed),
+    }
+
+
+def _with_feishu_summaries(
+    items: list[tuple[RawItem, Analysis]],
+    args: argparse.Namespace,
+) -> list[tuple[RawItem, Analysis]]:
+    if not items:
+        return []
+
+    configured_workers = _env_int("DEEPSEEK_FEISHU_SUMMARY_WORKERS", 1)
+    workers = max(1, min(configured_workers, len(items)))
+    results: list[tuple[RawItem, Analysis] | None] = [None] * len(items)
+
+    def summarize_one(index: int, item: RawItem, analysis: Analysis) -> tuple[int, RawItem, Analysis]:
+        summary = deepseek_brief_summary(item, analysis, limit=50)
+        return index, item, replace(analysis, summary=summary)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(summarize_one, index, item, analysis)
+            for index, (item, analysis) in enumerate(items)
+        ]
+        for future in as_completed(futures):
+            index, item, analysis = future.result()
+            results[index] = (item, analysis)
+    return [result for result in results if result is not None]
+
+
+def _provider_counts(items: list[tuple[RawItem, Analysis]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for _, analysis in items:
+        counts[analysis.provider] = counts.get(analysis.provider, 0) + 1
+    return counts
+
+
+def _analysis_status(
+    item: RawItem,
+    analysis: Analysis,
+    min_score: int,
+    item_states: dict[str, object],
+) -> str:
+    if already_alerted(item, item_states):
+        return STATUS_SENT
+    if analysis.alert_score < min_score:
+        return STATUS_ANALYZED
+    return STATUS_SELECTED
+
+
+def _dedupe_raw_items(items: list[RawItem]) -> list[RawItem]:
+    seen: set[str] = set()
+    unique: list[RawItem] = []
+    for item in items:
+        digest = item_hash(item)
+        if digest in seen:
+            continue
+        seen.add(digest)
+        unique.append(item)
+    return unique
 
 
 def _source_keywords(sources: list[object], source_name: str) -> list[str]:
@@ -185,6 +533,21 @@ def _source_keywords(sources: list[object], source_name: str) -> list[str]:
         if getattr(source, "name", None) == source_name:
             return list(getattr(source, "keywords", []))
     return []
+
+
+def _supabase_key_from_env() -> str | None:
+    return (
+        os.environ.get("SUPABASE_SECRET_KEY")
+        or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        or os.environ.get("SUPABASE_KEY")
+    )
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
 
 
 def _is_today_or_undated(item: object, now: datetime | None = None) -> bool:

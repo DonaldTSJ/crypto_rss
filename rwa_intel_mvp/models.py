@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -24,6 +25,13 @@ class Source:
     url_field: str = "url"
     summary_field: str = "summary"
     published_field: str = "published_at"
+    item_selector: str | None = None
+    title_selector: str | None = None
+    link_selector: str | None = None
+    date_selector: str | None = None
+    link_include: list[str] = field(default_factory=list)
+    link_exclude: list[str] = field(default_factory=list)
+    allow_web_page_fallback: bool = True
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Source":
@@ -41,6 +49,13 @@ class Source:
             url_field=str(data.get("url_field", "url")),
             summary_field=str(data.get("summary_field", "summary")),
             published_field=str(data.get("published_field", "published_at")),
+            item_selector=data.get("item_selector"),
+            title_selector=data.get("title_selector"),
+            link_selector=data.get("link_selector"),
+            date_selector=data.get("date_selector"),
+            link_include=list(data.get("link_include", [])),
+            link_exclude=list(data.get("link_exclude", [])),
+            allow_web_page_fallback=bool(data.get("allow_web_page_fallback", True)),
         )
 
 
@@ -51,14 +66,20 @@ class RawItem:
     source_url: str
     title: str
     url: str
+    source_category: str = "news"
     published_at: str | None = None
     summary: str = ""
     raw_text: str = ""
+    extraction_method: str = "record"
     fetched_at: str = field(default_factory=utc_now_iso)
 
     @property
     def identity_material(self) -> str:
         return (self.url or f"{self.source_name}:{self.title}").strip().lower()
+
+
+def item_hash(item: RawItem) -> str:
+    return hashlib.sha256(item.identity_material.encode("utf-8")).hexdigest()
 
 
 @dataclass

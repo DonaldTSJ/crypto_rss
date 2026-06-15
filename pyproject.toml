@@ -1,7 +1,7 @@
 [project]
 name = "crypto-rss"
 version = "0.1.0"
-description = "Crypto/RWA RSS intelligence collection, Lark/Feishu push, and Obsidian Markdown pipeline."
+description = "Crypto/RWA RSS intelligence collection, Supabase shared storage, and Lark/Feishu alert pipeline."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []

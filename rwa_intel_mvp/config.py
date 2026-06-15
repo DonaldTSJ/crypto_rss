@@ -37,7 +37,7 @@ def load_sources(path: str | Path | None = None) -> list[Source]:
 
 
 def _parse_env_line(line: str) -> tuple[str | None, str]:
-    stripped = line.strip()
+    stripped = line.strip().lstrip("\ufeff")
     if not stripped or stripped.startswith("#") or "=" not in stripped:
         return None, ""
     key, value = stripped.split("=", 1)
