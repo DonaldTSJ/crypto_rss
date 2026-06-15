@@ -129,6 +129,7 @@ class LinkCandidate:
     url: str
     attrs: dict[str, str]
     position: int
+    published_at: str | None = None
 
 
 class LinkExtractor(HTMLParser):
@@ -294,14 +295,16 @@ def collect_web_page(source: Source) -> RawItem:
 def build_listing_item(source: Source, link: LinkCandidate) -> RawItem:
     title = link.title
     text = link.title
-    published_at = None
+    published_at = link.published_at
     try:
         detail_html = fetch_text(link.url, headers=source.headers)
         detail_title = extract_title(detail_html)
         if detail_title and _should_use_detail_title(title, detail_title):
             title = detail_title
         detail_text = strip_html(detail_html)
-        published_at = extract_published_at(detail_html, detail_text, title)
+        detail_published_at = extract_published_at(detail_html, detail_text, title)
+        if detail_published_at:
+            published_at = detail_published_at
         if detail_text:
             text = detail_text
     except CollectError:
@@ -341,6 +344,7 @@ def build_web_page_item(source: Source, html: str) -> RawItem:
 def extract_listing_links(html: str, source: Source, limit: int = 10) -> list[LinkCandidate]:
     extractor = LinkExtractor(source.url)
     extractor.feed(html)
+    listing_text = strip_html(html)
     output: list[LinkCandidate] = []
     seen_urls: set[str] = set()
     for link in extractor.links:
@@ -353,6 +357,15 @@ def extract_listing_links(html: str, source: Source, limit: int = 10) -> list[Li
             continue
         if not _link_allowed(normalized, source):
             continue
+        published_at = normalized.published_at or _listing_date_for_link(html, listing_text, normalized.title, normalized.url)
+        if published_at != normalized.published_at:
+            normalized = LinkCandidate(
+                title=normalized.title,
+                url=normalized.url,
+                attrs=normalized.attrs,
+                position=normalized.position,
+                published_at=published_at,
+            )
         seen_urls.add(normalized.url)
         output.append(normalized)
         if len(output) >= limit:
@@ -526,6 +539,7 @@ def _visible_date_candidates(text: str) -> list[str]:
         rf"\b\d{{1,2}}\s+(?:{month_names})\s+\d{{4}}\b",
         r"\b\d{4}-\d{2}-\d{2}\b",
         r"\b\d{4}/\d{1,2}/\d{1,2}\b",
+        r"\b\d{1,2}\.\d{1,2}\.\d{4}\b",
     ]
     for pattern in patterns:
         for match in re.finditer(pattern, text, flags=re.IGNORECASE):
@@ -552,7 +566,59 @@ def _normalize_published_date(value: str) -> str | None:
             return datetime(year, month, day).date().isoformat()
         except ValueError:
             return None
+    dot_match = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})$", text)
+    if dot_match:
+        month, day, year = (int(part) for part in dot_match.groups())
+        try:
+            return datetime(year, month, day).date().isoformat()
+        except ValueError:
+            return None
     return None
+
+
+def _listing_date_for_link(html: str, text: str, title: str, url: str) -> str | None:
+    html_segment = _listing_html_segment(html, title, url)
+    if html_segment:
+        for candidate in _metadata_date_candidates(html_segment):
+            normalized = _normalize_published_date(candidate)
+            if normalized:
+                return normalized
+        html_text = strip_html(html_segment)
+        for candidate in _visible_date_candidates(html_text):
+            normalized = _normalize_published_date(candidate)
+            if normalized:
+                return normalized
+
+    clean = re.sub(r"\s+", " ", text or "").strip()
+    needle = re.sub(r"\s+", " ", title or "").strip().lower()
+    if len(needle) < 8:
+        return None
+    lower = clean.lower()
+    start = 0
+    while True:
+        index = lower.find(needle, start)
+        if index < 0:
+            return None
+        segment = clean[index : index + 700]
+        for candidate in _visible_date_candidates(segment):
+            normalized = _normalize_published_date(candidate)
+            if normalized:
+                return normalized
+        start = index + 1
+
+
+def _listing_html_segment(html: str, title: str, url: str) -> str:
+    lower = html.lower()
+    parsed = urllib.parse.urlparse(url)
+    needles = [parsed.path.lower()]
+    title_needle = re.sub(r"\s+", " ", title or "").strip().lower()
+    if len(title_needle) >= 8:
+        needles.append(title_needle)
+    indexes = [lower.find(needle) for needle in needles if needle and lower.find(needle) >= 0]
+    if not indexes:
+        return ""
+    index = min(indexes)
+    return html[max(0, index - 1000) : index + 3000]
 
 
 def _article_date_scope(text: str, title: str | None) -> str:

@@ -302,6 +302,56 @@ class RwaIntelMvpTests(unittest.TestCase):
             items = collect_source(source, limit=5)
         self.assertEqual(items[0].published_at, "2026-03-30")
 
+    def test_web_source_extracts_dot_separated_visible_article_date(self):
+        source = Source(
+            name="Uniswap Foundation Blog",
+            kind="web",
+            url="https://uniswapfoundation.org/blog",
+            link_include=["/blog/"],
+        )
+        listing_html = """
+        <html><body>
+          <a href="/blog/uf-builder-update-41">UF Builder Update #41: Funding Hooks, v4 and Unichain</a>
+        </body></html>
+        """
+        article_html = """
+        <html><head><title>UF Builder Update #41</title></head><body>
+          <main>
+            UF Builder Update #41: Funding Hooks, v4 and Unichain
+            By Straith Schreder 12.8.2025
+            Welcome to this week's Builder Update.
+          </main>
+        </body></html>
+        """
+        with patch("rwa_intel_mvp.collectors.fetch_text", side_effect=[listing_html, article_html]):
+            items = collect_source(source, limit=5)
+        self.assertEqual(items[0].published_at, "2025-12-08")
+
+    def test_web_source_uses_listing_card_date_when_detail_page_has_no_article_date(self):
+        source = Source(
+            name="1inch Blog",
+            kind="web",
+            url="https://blog.1inch.io/",
+            link_include=["/blog/post/"],
+        )
+        listing_html = """
+        <html><body>
+          <article>
+            <a href="/blog/post/how-do-i-trade-spacex-rwas">How do I trade SpaceX RWAs?</a>
+            <p>Some card excerpt about tokenized assets.</p>
+            <time datetime="2026-06-10T18:59:54.000+00:00">Jun 10, 2026</time>
+          </article>
+        </body></html>
+        """
+        article_html = """
+        <html><head><title>1inch Blog</title></head><body>
+          <div id="app">Blog application shell</div>
+        </body></html>
+        """
+        with patch("rwa_intel_mvp.collectors.fetch_text", side_effect=[listing_html, article_html]):
+            items = collect_source(source, limit=5)
+        self.assertEqual(items[0].published_at, "2026-06-10T18:59:54.000+00:00")
+
     def test_web_source_uses_detail_title_when_listing_title_is_url(self):
         source = Source(
             name="Project Blog",
