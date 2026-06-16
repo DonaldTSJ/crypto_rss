@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import http.client
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -16,6 +18,8 @@ from .models import Analysis, RawItem, item_hash, utc_now_iso
 DEFAULT_SUPABASE_TABLE = "crypto_intel_items"
 DEFAULT_TIMEOUT_SECONDS = 20
 DEFAULT_DASHBOARD_LIMIT = 100
+DEFAULT_RETRY_ATTEMPTS = 3
+DEFAULT_RETRY_DELAY_SECONDS = 1.0
 SELECT_DASHBOARD_FIELDS = ",".join(
     [
         "name:title",
@@ -24,6 +28,38 @@ SELECT_DASHBOARD_FIELDS = ",".join(
         "importance:importance_score",
         "projects",
         "asset_classes",
+    ]
+)
+SELECT_BRIEF_FIELDS = ",".join(
+    [
+        "item_hash",
+        "run_date",
+        "title",
+        "url",
+        "source_name",
+        "source_kind",
+        "source_url",
+        "published_at",
+        "summary",
+        "business_impact",
+        "next_action",
+        "raw_summary",
+        "raw_text",
+        "relevance_score",
+        "importance_score",
+        "alert_score",
+        "confidence",
+        "provider",
+        "categories",
+        "projects",
+        "asset_classes",
+        "chains",
+        "jurisdictions",
+        "reasons",
+        "tags",
+        "status",
+        "last_seen_at",
+        "alert_sent_at",
     ]
 )
 STATUS_COLLECTED = "collected"
@@ -192,6 +228,52 @@ def fetch_dashboard_items(
         return []
     if not isinstance(rows, list):
         raise SupabaseError(f"Supabase dashboard query returned unexpected payload: {rows!r}")
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def fetch_supabase_brief_rows(
+    supabase_url: str | None,
+    supabase_key: str | None,
+    table: str = DEFAULT_SUPABASE_TABLE,
+    statuses: list[str] | None = None,
+    run_date_gte: str | None = None,
+    min_score: int | None = None,
+    search: str | None = None,
+    limit: int = DEFAULT_DASHBOARD_LIMIT,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+) -> list[dict[str, Any]]:
+    _require_credentials(supabase_url, supabase_key)
+    bounded_limit = max(1, min(limit, 500))
+    query_parts = [
+        ("select", SELECT_BRIEF_FIELDS),
+        ("order", "run_date.desc,alert_score.desc,importance_score.desc,published_at.desc,last_seen_at.desc"),
+        ("limit", str(bounded_limit)),
+    ]
+    clean_statuses = [status.strip() for status in statuses or [] if status.strip()]
+    if clean_statuses:
+        query_parts.append(("status", f"in.({','.join(clean_statuses)})"))
+    if run_date_gte:
+        query_parts.append(("run_date", f"gte.{run_date_gte}"))
+    if min_score is not None:
+        query_parts.append(("alert_score", f"gte.{int(min_score)}"))
+    if search:
+        safe_search = _sanitize_search(search)
+        if safe_search:
+            pattern = f"*{safe_search}*"
+            query_parts.append(
+                (
+                    "or",
+                    f"(title.ilike.{pattern},summary.ilike.{pattern},source_name.ilike.{pattern},business_impact.ilike.{pattern})",
+                )
+            )
+
+    query = urllib.parse.urlencode(query_parts, doseq=True, safe="(),.*")
+    endpoint = _rest_endpoint(str(supabase_url), table, query=query)
+    rows = _request_json("GET", endpoint, str(supabase_key), timeout=timeout)
+    if rows is None:
+        return []
+    if not isinstance(rows, list):
+        raise SupabaseError(f"Supabase brief query returned unexpected payload: {rows!r}")
     return [row for row in rows if isinstance(row, dict)]
 
 
@@ -401,8 +483,10 @@ def _request_json(
     data: object | None = None,
     headers: dict[str, str] | None = None,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    retry_attempts: int = DEFAULT_RETRY_ATTEMPTS,
 ) -> object:
-    body = None if data is None else json.dumps(data, ensure_ascii=False).encode("utf-8")
+    clean_data = _strip_postgres_nuls(data)
+    body = None if clean_data is None else json.dumps(clean_data, ensure_ascii=False).encode("utf-8")
     request_headers = {
         "apikey": supabase_key,
         "Authorization": f"Bearer {supabase_key}",
@@ -410,16 +494,29 @@ def _request_json(
     }
     request_headers.update(headers or {})
     request = urllib.request.Request(endpoint, data=body, headers=request_headers, method=method)
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            response_body = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
-        raise SupabaseError(f"Supabase request failed ({exc.code}): {error_body[:500]}") from exc
-    except urllib.error.URLError as exc:
-        raise SupabaseError(f"Supabase request failed: {exc}") from exc
-    except OSError as exc:
-        raise SupabaseError(f"Supabase request timed out or failed: {exc}") from exc
+    attempts = max(1, int(retry_attempts))
+    response_body = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                response_body = response.read().decode("utf-8", errors="replace")
+            break
+        except urllib.error.HTTPError as exc:
+            if _should_retry_http_error(exc, attempt, attempts):
+                _sleep_before_retry(attempt)
+                continue
+            error_body = exc.read().decode("utf-8", errors="replace")
+            raise SupabaseError(f"Supabase request failed ({exc.code}): {error_body[:500]}") from exc
+        except urllib.error.URLError as exc:
+            if attempt < attempts:
+                _sleep_before_retry(attempt)
+                continue
+            raise SupabaseError(f"Supabase request failed after {attempts} attempts: {exc}") from exc
+        except (http.client.IncompleteRead, OSError) as exc:
+            if attempt < attempts:
+                _sleep_before_retry(attempt)
+                continue
+            raise SupabaseError(f"Supabase request timed out or failed after {attempts} attempts: {exc}") from exc
 
     if not response_body:
         return None
@@ -434,6 +531,14 @@ def _require_credentials(supabase_url: str | None, supabase_key: str | None) -> 
         raise SupabaseError("SUPABASE_URL is required for live Supabase storage.")
     if not supabase_key:
         raise SupabaseError("SUPABASE_SECRET_KEY or SUPABASE_SERVICE_ROLE_KEY is required for live Supabase storage.")
+
+
+def _should_retry_http_error(exc: urllib.error.HTTPError, attempt: int, attempts: int) -> bool:
+    return attempt < attempts and exc.code in {429, 500, 502, 503, 504}
+
+
+def _sleep_before_retry(attempt: int) -> None:
+    time.sleep(DEFAULT_RETRY_DELAY_SECONDS * attempt)
 
 
 def _rest_endpoint(supabase_url: str, table: str, query: str | None = None) -> str:
@@ -484,6 +589,16 @@ def _clip(text: str, limit: int) -> str:
     if len(clean) <= limit:
         return clean
     return clean[: limit - 3].rstrip() + "..."
+
+
+def _strip_postgres_nuls(value: object) -> object:
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, list):
+        return [_strip_postgres_nuls(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _strip_postgres_nuls(item) for key, item in value.items()}
+    return value
 
 
 def _sanitize_search(value: str) -> str:

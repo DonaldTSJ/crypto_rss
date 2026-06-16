@@ -12,34 +12,49 @@ from .models import Analysis, RawItem
 
 
 KEYWORD_WEIGHTS: dict[str, int] = {
-    "tokenized": 15,
-    "tokenization": 15,
-    "tokenised": 15,
-    "tokenisation": 15,
-    "tokenise": 12,
-    "rwa": 16,
-    "real-world asset": 16,
-    "real world asset": 16,
-    "digital asset": 14,
-    "digital assets": 14,
-    "virtual asset": 14,
-    "virtual assets": 14,
-    "crypto asset": 14,
-    "crypto assets": 14,
-    "cryptoasset": 14,
-    "cryptoassets": 14,
-    "dlt": 10,
-    "distributed ledger": 10,
+    "tokenized": 28,
+    "tokenization": 28,
+    "tokenised": 28,
+    "tokenisation": 28,
+    "tokenise": 24,
+    "rwa": 34,
+    "rwa earn": 42,
+    "real-world asset": 34,
+    "real world asset": 34,
+    "digital asset": 24,
+    "digital assets": 24,
+    "digital asset regulation": 32,
+    "virtual asset": 22,
+    "virtual assets": 22,
+    "crypto": 6,
+    "crypto regulation": 28,
+    "crypto market structure": 28,
+    "crypto custody": 22,
+    "crypto asset": 24,
+    "crypto assets": 24,
+    "cryptoasset": 24,
+    "cryptoassets": 24,
+    "dlt": 18,
+    "distributed ledger": 18,
     "mica": 12,
     "treasury": 12,
     "money market": 12,
-    "stablecoin": 9,
-    "stablecoin license": 24,
-    "stablecoin licensing": 22,
-    "stablecoin regulation": 20,
-    "stablecoin framework": 20,
-    "digital bond": 12,
-    "bond issuance": 9,
+    "stablecoin": 18,
+    "stablecoin settlement": 26,
+    "stablecoin license": 36,
+    "stablecoin licensing": 34,
+    "stablecoin regulation": 34,
+    "stablecoin framework": 34,
+    "digital bond": 22,
+    "bond issuance": 16,
+    "bitcoin etf": 26,
+    "ether etf": 26,
+    "ethereum etf": 26,
+    "crypto etf": 26,
+    "crypto etp": 24,
+    "spot bitcoin etf": 30,
+    "spot ether etf": 30,
+    "ibit": 18,
     "proof of reserve": 20,
     "proof-of-reserves": 22,
     "proof of reserves": 22,
@@ -111,14 +126,112 @@ KEYWORD_WEIGHTS: dict[str, int] = {
     "security token": 12,
     "tokenized fund": 18,
     "tokenized funds": 18,
-    "listing": 4,
-    "delisting": 10,
-    "new listing": 7,
-    "api update": 6,
-    "maintenance": 2,
-    "wallet maintenance": 4,
-    "governance proposal": 10,
-    "proposal": 4,
+    "listing": 2,
+    "delisting": 2,
+    "new listing": 3,
+    "api update": 2,
+    "maintenance": 1,
+    "wallet maintenance": 2,
+    "governance proposal": 5,
+    "proposal": 2,
+}
+
+CORE_TOPIC_TERMS = {
+    "tokenized",
+    "tokenization",
+    "tokenised",
+    "tokenisation",
+    "tokenise",
+    "rwa",
+    "rwa earn",
+    "real-world asset",
+    "real world asset",
+    "digital asset",
+    "digital assets",
+    "digital asset regulation",
+    "virtual asset",
+    "virtual assets",
+    "crypto asset",
+    "crypto assets",
+    "cryptoasset",
+    "cryptoassets",
+    "crypto regulation",
+    "crypto market structure",
+    "crypto custody",
+    "dlt",
+    "distributed ledger",
+    "mica",
+    "stablecoin",
+    "stablecoin settlement",
+    "stablecoin license",
+    "stablecoin licensing",
+    "stablecoin regulation",
+    "stablecoin framework",
+    "digital bond",
+    "bitcoin etf",
+    "ether etf",
+    "ethereum etf",
+    "crypto etf",
+    "crypto etp",
+    "spot bitcoin etf",
+    "spot ether etf",
+    "ibit",
+    "proof of reserve",
+    "proof-of-reserves",
+    "proof of reserves",
+    "transfer agent",
+    "buidl",
+    "ondo",
+    "ousg",
+    "usdy",
+    "benji",
+    "superstate",
+    "centrifuge",
+    "xstocks",
+    "securitize",
+    "dinari",
+    "plume",
+    "hadron",
+    "stock token",
+    "stock tokens",
+    "tokenized stock",
+    "tokenized stocks",
+    "tokenized securities",
+    "digital securities",
+    "security token",
+    "tokenized fund",
+    "tokenized funds",
+}
+
+WEAK_OPERATIONAL_TERMS = {
+    "stock",
+    "stocks",
+    "listing",
+    "delisting",
+    "new listing",
+    "api update",
+    "maintenance",
+    "wallet maintenance",
+    "proposal",
+    "governance proposal",
+    "settlement",
+    "clearing",
+    "custody",
+    "custodian",
+    "license",
+    "licence",
+    "sec",
+    "mas",
+    "sfc",
+    "hkma",
+    "esma",
+    "fca",
+    "cftc",
+    "finra",
+    "vara",
+    "adgm",
+    "iosco",
+    "bis",
 }
 
 PROJECT_TERMS: dict[str, list[str]] = {
@@ -136,19 +249,25 @@ PROJECT_TERMS: dict[str, list[str]] = {
 ASSET_CLASS_TERMS: dict[str, list[str]] = {
     "tokenized_treasuries": ["treasury", "t-bill", "money market", "buidl", "ousg", "usdy", "benji"],
     "tokenized_equities": [
-        "stock",
-        "stocks",
-        "equity",
-        "equities",
-        "etf",
         "xstocks",
         "stock token",
         "stock tokens",
         "tokenized stock",
         "tokenized stocks",
         "tokenized equities",
-        "nasdaq",
-        "nyse",
+        "tokenized equity",
+        "digital securities",
+        "security token",
+    ],
+    "crypto_etf_products": [
+        "bitcoin etf",
+        "ether etf",
+        "ethereum etf",
+        "crypto etf",
+        "crypto etp",
+        "spot bitcoin etf",
+        "spot ether etf",
+        "ibit",
     ],
     "private_credit": ["credit", "loan", "receivable", "private credit"],
     "stablecoin_reserves": ["stablecoin", "usdt", "usdc", "pyusd", "fdusd", "usd1", "reserve", "reserves", "attestation", "collateral"],
@@ -216,6 +335,8 @@ ASSET_CLASS_TERMS: dict[str, list[str]] = {
 CHAIN_TERMS = ["ethereum", "solana", "polygon", "arbitrum", "avalanche", "aptos", "mantle", "sui", "xrpl", "base"]
 JURISDICTION_TERMS = ["u.s.", "us ", "united states", "singapore", "hong kong", "switzerland", "bermuda", "eu"]
 BRIEF_SUMMARY_FAILURE_FALLBACK = "摘要生成失败，请点标题查看原文。"
+
+SCORING_RAW_TEXT_LIMIT = 1000
 
 SOURCE_CATEGORY_WEIGHTS: dict[str, dict[str, int]] = {
     "regulator": {
@@ -308,10 +429,14 @@ DEEPSEEK_SYSTEM_PROMPT = """你是 Crypto/Web3/RWA 情报分析助手。请判�
 
 
 def passes_rule_filter(item: RawItem, extra_keywords: list[str] | None = None) -> bool:
-    haystack = _haystack(item)
-    terms = set(_effective_keyword_weights(item))
-    terms.update(term.lower() for term in (extra_keywords or []))
-    return any(term in haystack for term in terms)
+    haystack = _content_haystack(item)
+    matched = _matched_terms(_effective_keyword_weights(item), haystack)
+    extra_matched = [
+        term.strip().lower()
+        for term in (extra_keywords or [])
+        if _contains_term(haystack, term.strip().lower())
+    ]
+    return _has_core_topic_signal(matched, extra_matched, haystack)
 
 
 def analyze_item(item: RawItem, use_deepseek: bool = False) -> Analysis:
@@ -322,43 +447,52 @@ def analyze_item(item: RawItem, use_deepseek: bool = False) -> Analysis:
 
 
 def heuristic_analyze(item: RawItem) -> Analysis:
-    haystack = _haystack(item)
+    haystack = _content_haystack(item)
     weights = _effective_keyword_weights(item)
-    matched = [term for term in weights if term in haystack]
+    matched = _matched_terms(weights, haystack)
+    has_core_signal = _has_core_topic_signal(matched, [], haystack)
     relevance = _apply_extraction_score_adjustment(
         min(100, sum(weights[term] for term in matched)),
         item,
     )
+    if not has_core_signal:
+        relevance = min(relevance, 30)
+
     importance = relevance
-    if any(term in haystack for term in ["launch", "partner", "files", "approved", "integrates", "mainnet"]):
+    if _contains_any(haystack, ["launch", "partner", "files", "approved", "integrates", "mainnet"]):
         importance = min(100, importance + 12)
-    if any(term in haystack for term in ["blackrock", "jpmorgan", "franklin", "coinbase", "binance", "kraken"]):
+    if _contains_any(haystack, ["blackrock", "jpmorgan", "franklin", "coinbase", "binance", "kraken"]):
         importance = min(100, importance + 10)
     importance = min(100, importance + _source_importance_bonus(item, haystack))
+    if not has_core_signal:
+        importance = min(importance, 34)
 
     projects = _classify(PROJECT_TERMS, haystack)
     asset_classes = _classify(ASSET_CLASS_TERMS, haystack)
-    chains = [chain for chain in CHAIN_TERMS if chain in haystack]
-    jurisdictions = [term.strip() for term in JURISDICTION_TERMS if term in haystack]
-    categories = sorted(set(asset_classes + ["rwa"] if relevance else asset_classes))
+    chains = [chain for chain in CHAIN_TERMS if _contains_term(haystack, chain)]
+    jurisdictions = [term.strip() for term in JURISDICTION_TERMS if _contains_term(haystack, term.strip())]
+    categories = sorted(set(asset_classes + ["rwa"] if _is_rwa_signal(matched, asset_classes) else asset_classes))
     summary = _sentence(item.summary or item.raw_text or item.title, limit=220)
     business_impact = _impact(asset_classes, projects)
     next_action = _next_action(relevance, projects, asset_classes)
 
-    return Analysis(
-        relevance_score=relevance,
-        importance_score=importance,
-        categories=categories,
-        projects=projects,
-        asset_classes=asset_classes,
-        chains=chains,
-        jurisdictions=jurisdictions,
-        summary=summary or item.title,
-        business_impact=business_impact,
-        next_action=next_action,
-        confidence=_confidence_for(relevance, item),
-        reasons=_analysis_reasons(matched, item),
-        provider="rules",
+    return _apply_topical_guard(
+        item,
+        Analysis(
+            relevance_score=relevance,
+            importance_score=importance,
+            categories=categories,
+            projects=projects,
+            asset_classes=asset_classes,
+            chains=chains,
+            jurisdictions=jurisdictions,
+            summary=summary or item.title,
+            business_impact=business_impact,
+            next_action=next_action,
+            confidence=_confidence_for(relevance, item),
+            reasons=_analysis_reasons(matched, item),
+            provider="rules",
+        ),
     )
 
 
@@ -441,7 +575,7 @@ def deepseek_analyze(item: RawItem, fallback: Analysis) -> Analysis:
         data = json.loads(response_body)
         content = data["choices"][0]["message"]["content"]
         parsed = _extract_json(content)
-        return Analysis.from_dict(parsed, provider="deepseek")
+        return _apply_topical_guard(item, Analysis.from_dict(parsed, provider="deepseek"))
     except (urllib.error.URLError, OSError, http.client.IncompleteRead, KeyError, IndexError, json.JSONDecodeError, ValueError) as exc:
         fallback.reasons = [*fallback.reasons, f"deepseek_fallback:{type(exc).__name__}"]
         return fallback
@@ -567,7 +701,7 @@ def _keyword_context(item: RawItem, fallback: Analysis, limit: int | None = None
         return clean
 
     terms = [term for term in fallback.reasons if term]
-    terms.extend(term for term in _effective_keyword_weights(item) if term in clean.lower())
+    terms.extend(term for term in _effective_keyword_weights(item) if _contains_term(clean.lower(), term))
     snippets: list[str] = []
     lower = clean.lower()
     for term in terms[:12]:
@@ -643,6 +777,65 @@ def _effective_keyword_weights(item: RawItem) -> dict[str, int]:
     return weights
 
 
+def _matched_terms(weights: dict[str, int], haystack: str) -> list[str]:
+    return [term for term in weights if _contains_term(haystack, term)]
+
+
+def _has_core_topic_signal(
+    matched_terms: list[str],
+    extra_terms: list[str],
+    haystack: str,
+) -> bool:
+    terms = {term for term in matched_terms + extra_terms if term and term not in WEAK_OPERATIONAL_TERMS}
+    if any(term in CORE_TOPIC_TERMS for term in terms):
+        return True
+    if _contains_term(haystack, "crypto") and _contains_any(
+        haystack,
+        ["regulation", "regulated", "license", "licence", "custody", "settlement", "clearing", "etf", "etp", "market structure"],
+    ):
+        return True
+    if _contains_any(haystack, ["bitcoin", "ether", "ethereum"]) and _contains_any(haystack, ["etf", "etp"]):
+        return True
+    return False
+
+
+def _apply_topical_guard(item: RawItem, analysis: Analysis) -> Analysis:
+    haystack = _content_haystack(item)
+    matched = _matched_terms(_effective_keyword_weights(item), haystack)
+    if _has_core_topic_signal(matched, [], haystack):
+        return analysis
+
+    analysis.relevance_score = min(analysis.relevance_score, 30)
+    analysis.importance_score = min(analysis.importance_score, 34)
+    analysis.categories = [category for category in analysis.categories if category != "rwa"]
+    if "topical_guard:no_core_signal" not in analysis.reasons:
+        analysis.reasons = [*analysis.reasons, "topical_guard:no_core_signal"]
+    return analysis
+
+
+def _is_rwa_signal(matched_terms: list[str], asset_classes: list[str]) -> bool:
+    rwa_terms = {
+        "tokenized",
+        "tokenization",
+        "tokenised",
+        "tokenisation",
+        "rwa",
+        "rwa earn",
+        "real-world asset",
+        "real world asset",
+        "tokenized securities",
+        "digital securities",
+        "tokenized fund",
+        "tokenized funds",
+        "tokenized stock",
+        "tokenized stocks",
+        "stock token",
+        "stock tokens",
+    }
+    rwa_classes = {"tokenized_treasuries", "tokenized_equities", "private_credit"}
+    return bool(set(matched_terms) & rwa_terms or set(asset_classes) & rwa_classes)
+
+
 def _apply_extraction_score_adjustment(score: int, item: RawItem) -> int:
     method = getattr(item, "extraction_method", "record")
     if method == "web_page":
@@ -654,11 +847,21 @@ def _apply_extraction_score_adjustment(score: int, item: RawItem) -> int:
 
 def _source_importance_bonus(item: RawItem, haystack: str) -> int:
     category = getattr(item, "source_category", "").lower()
-    if category == "regulator" and any(term in haystack for term in ["enforcement", "license", "licence", "consultation", "framework"]):
+    matched = _matched_terms(_effective_keyword_weights(item), haystack)
+    if category == "regulator" and _has_core_topic_signal(matched, [], haystack) and _contains_any(
+        haystack,
+        ["enforcement", "license", "licence", "consultation", "framework"],
+    ):
         return 10
-    if category == "cex" and any(term in haystack for term in ["new listing", "delisting", "api update", "proof of reserve", "proof of reserves"]):
-        return 8
-    if category.startswith("rwa") and any(term in haystack for term in ["tokenized securities", "tokenized fund", "tokenized stocks", "digital securities"]):
+    if category == "cex" and _has_core_topic_signal(matched, [], haystack) and _contains_any(
+        haystack,
+        ["launch", "rwa", "tokenized", "stablecoin", "proof of reserve", "proof of reserves"],
+    ):
+        return 12
+    if category.startswith("rwa") and _contains_any(
+        haystack,
+        ["tokenized securities", "tokenized fund", "tokenized stocks", "digital securities"],
+    ):
         return 10
     return 0
 
@@ -683,25 +886,51 @@ def _analysis_reasons(matched: list[str], item: RawItem) -> list[str]:
     return reasons
 
 
-def _haystack(item: RawItem) -> str:
+def _content_haystack(item: RawItem) -> str:
+    raw_text = item.raw_text[:SCORING_RAW_TEXT_LIMIT] if item.raw_text else ""
     return " ".join(
         [
             item.title,
             item.summary,
-            item.raw_text,
+            raw_text,
+        ]
+    ).lower()
+
+
+def _metadata_haystack(item: RawItem) -> str:
+    return " ".join(
+        [
             item.source_name,
             getattr(item, "source_category", ""),
+            getattr(item, "source_kind", ""),
+            getattr(item, "source_url", ""),
             getattr(item, "extraction_method", ""),
         ]
     ).lower()
 
 
+def _haystack(item: RawItem) -> str:
+    return " ".join([_content_haystack(item), _metadata_haystack(item)]).strip()
+
+
 def _classify(mapping: dict[str, list[str]], haystack: str) -> list[str]:
     output = []
     for label, terms in mapping.items():
-        if any(term in haystack for term in terms):
+        if any(_contains_term(haystack, term) for term in terms):
             output.append(label)
     return output
+
+
+def _contains_any(haystack: str, terms: list[str]) -> bool:
+    return any(_contains_term(haystack, term) for term in terms)
+
+
+def _contains_term(haystack: str, term: str) -> bool:
+    normalized = term.strip().lower()
+    if not normalized:
+        return False
+    pattern = r"(?<![a-z0-9])" + r"\s+".join(re.escape(part) for part in normalized.split()) + r"(?![a-z0-9])"
+    return re.search(pattern, haystack) is not None
 
 
 def _sentence(text: str, limit: int) -> str:

@@ -17,6 +17,8 @@ class Source:
     url: str
     category: str = "news"
     priority: str = "normal"
+    source_class: str = "message"
+    schedule_frequency: str = "daily"
     enabled: bool = True
     keywords: list[str] = field(default_factory=list)
     headers: dict[str, str] = field(default_factory=dict)
@@ -35,12 +37,16 @@ class Source:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Source":
+        category = str(data.get("category", "news"))
+        source_class = _source_class_from_data(data, category)
         return cls(
             name=str(data["name"]),
             kind=str(data.get("kind", data.get("type", "rss"))).lower(),
             url=str(data["url"]),
-            category=str(data.get("category", "news")),
+            category=category,
             priority=str(data.get("priority", "normal")),
+            source_class=source_class,
+            schedule_frequency=_schedule_frequency_from_data(data, source_class),
             enabled=bool(data.get("enabled", True)),
             keywords=list(data.get("keywords", [])),
             headers=dict(data.get("headers", {})),
@@ -57,6 +63,26 @@ class Source:
             link_exclude=list(data.get("link_exclude", [])),
             allow_web_page_fallback=bool(data.get("allow_web_page_fallback", True)),
         )
+
+
+def _source_class_from_data(data: dict[str, Any], category: str) -> str:
+    raw = str(data.get("source_class") or data.get("source_type") or "").strip().lower()
+    if raw in {"regulatory", "regulator", "regulation"}:
+        return "regulatory"
+    if raw in {"message", "messages", "news", "market"}:
+        return "message"
+    if category.strip().lower() == "regulator":
+        return "regulatory"
+    return "message"
+
+
+def _schedule_frequency_from_data(data: dict[str, Any], source_class: str) -> str:
+    raw = str(data.get("schedule_frequency") or data.get("frequency") or "").strip().lower()
+    if raw in {"weekly", "week"}:
+        return "weekly"
+    if raw in {"daily", "day"}:
+        return "daily"
+    return "weekly" if source_class == "regulatory" else "daily"
 
 
 @dataclass

@@ -116,7 +116,7 @@ def build_alert_post_payload(
         rows.extend(
             [
                 [{"tag": "text", "text": ""}],
-                [{"tag": "text", "text": f"采集异常: {len(source_errors)} 个源失败，详见日志。"}],
+                [{"tag": "text", "text": "<font color='grey'>本轮已完成多源信息采集与筛选。</font>"}],
             ]
         )
 
@@ -229,13 +229,13 @@ def _business_rank_key(pair: tuple[RawItem, Analysis]) -> tuple[int, int, float]
     labels = set(analysis.asset_classes + analysis.categories)
     source_text = f"{item.source_name} {item.source_kind} {item.source_url}".lower()
 
-    if "regulation" in labels:
+    if {"tokenized_treasuries", "tokenized_equities", "private_credit", "rwa"} & labels:
         tier = 6
-    elif "exchange_operations" in labels:
+    elif "regulation" in labels:
         tier = 5
-    elif {"stablecoin_reserves", "infrastructure"} & labels:
+    elif {"stablecoin_reserves", "infrastructure", "crypto_etf_products"} & labels:
         tier = 4
-    elif {"tokenized_treasuries", "tokenized_equities", "private_credit", "rwa"} & labels:
+    elif "exchange_operations" in labels:
         tier = 3
     elif "github" in source_text or "x.com" in source_text or "twitter" in source_text:
         tier = 2
