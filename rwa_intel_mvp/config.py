@@ -23,7 +23,7 @@ def load_local_env(paths: list[str | Path] | None = None) -> None:
                     os.environ[key] = value
 
 
-def load_sources(path: str | Path | None = None) -> list[Source]:
+def load_sources(path: str | Path | None = None, source_class: str | None = None) -> list[Source]:
     source_path = Path(path) if path else DEFAULT_SOURCES_PATH
     with source_path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
@@ -33,7 +33,19 @@ def load_sources(path: str | Path | None = None) -> list[Source]:
         rows = payload.get("sources", [])
     else:
         rows = []
-    return [Source.from_dict(row) for row in rows if row.get("enabled", True)]
+    sources = [Source.from_dict(row) for row in rows if row.get("enabled", True)]
+    return filter_sources(sources, source_class)
+
+
+def filter_sources(sources: list[Source], source_class: str | None = None) -> list[Source]:
+    normalized = (source_class or "all").strip().lower()
+    if normalized in {"", "all"}:
+        return list(sources)
+    if normalized in {"regulator", "regulation"}:
+        normalized = "regulatory"
+    if normalized in {"news", "messages"}:
+        normalized = "message"
+    return [source for source in sources if source.source_class == normalized]
 
 
 def _parse_env_line(line: str) -> tuple[str | None, str]:

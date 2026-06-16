@@ -2,20 +2,25 @@ import io
 import http.client
 import json
 import os
+from pathlib import Path
+import tempfile
 import time
 import unittest
 import urllib.error
 import urllib.parse
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import rwa_intel_mvp.cli as cli_module
 from rwa_intel_mvp.analyzer import analyze_item, deepseek_analyze, deepseek_brief_summary, passes_rule_filter, _brief_summary_payload
 from rwa_intel_mvp.collectors import collect_source
-from rwa_intel_mvp.config import load_sources
+from rwa_intel_mvp.config import filter_sources, load_sources
 from rwa_intel_mvp.dashboard import DASHBOARD_HTML
-from rwa_intel_mvp.feishu import build_alert_interactive_payload, build_text_payload, format_alert
+from rwa_intel_mvp.feishu import build_alert_interactive_payload, build_text_payload, format_alert, rank_alert_items
 from rwa_intel_mvp.models import RawItem, Source, item_hash
-from rwa_intel_mvp.cli import build_parser, run_pipeline, _with_feishu_summaries
+from rwa_intel_mvp.cli import build_parser, run_pipeline, _scheduled_run_args, _with_feishu_summaries
+from rwa_intel_mvp.obsidian import sync_obsidian_brief
 from rwa_intel_mvp.supabase import (
     STATUS_SELECTED,
     STATUS_SENT,
@@ -26,7 +31,10 @@ from rwa_intel_mvp.supabase import (
     build_analysis_row,
     build_collected_rows,
     fetch_dashboard_items,
+    fetch_supabase_brief_rows,
     should_skip_seen,
+    _request_json,
+    _strip_postgres_nuls,
     upsert_collected_items,
 )
 
@@ -41,6 +49,38 @@ class RwaIntelMvpTests(unittest.TestCase):
             url="https://example.com/news/1",
             summary="BlackRock and Securitize expanded BUIDL for tokenized treasuries and collateral use.",
         )
+
+    def supabase_brief_row(self, **overrides):
+        row = {
+            "title": "MEMX proposes higher IBIT options position limits",
+            "url": "https://www.federalregister.gov/documents/ibit-options",
+            "source_name": "SEC Federal Register",
+            "source_kind": "rss",
+            "source_url": "https://www.federalregister.gov/articles/search.rss",
+            "published_at": "2026-06-16T04:00:00+00:00",
+            "summary": "MEMX proposed higher position and exercise limits for options on IBIT.",
+            "raw_summary": "MEMX proposed higher position and exercise limits for options on IBIT.",
+            "raw_text": "MEMX proposed higher position and exercise limits for options on IBIT.",
+            "relevance_score": 88,
+            "importance_score": 90,
+            "alert_score": 90,
+            "confidence": 0.86,
+            "provider": "deepseek",
+            "categories": ["regulation"],
+            "projects": [],
+            "asset_classes": ["crypto_etf_products"],
+            "chains": [],
+            "jurisdictions": ["u.s."],
+            "business_impact": "IBIT options limits may affect crypto ETF market structure.",
+            "next_action": "Track SEC and exchange rule changes.",
+            "reasons": ["crypto_etf_products"],
+            "status": "sent",
+            "run_date": "2026-06-16",
+            "last_seen_at": "2026-06-16T08:00:00+00:00",
+            "alert_sent_at": "2026-06-16T08:10:00+00:00",
+        }
+        row.update(overrides)
+        return row
 
     def test_rule_filter_and_alert_format(self):
         item = self.sample_item()
@@ -117,6 +157,151 @@ class RwaIntelMvpTests(unittest.TestCase):
         analysis = analyze_item(item)
         self.assertLess(analysis.alert_score, 35)
 
+    def test_regulator_source_name_does_not_make_generic_notice_relevant(self):
+        item = RawItem(
+            source_name="SEC Federal Register",
+            source_kind="rss",
+            source_url="https://www.federalregister.gov",
+            source_category="regulator",
+            title=(
+                "Order Granting Temporary Exemptive Relief Pursuant to Section 36(a)(1) "
+                "of the Securities Exchange Act and Regulation NMS"
+            ),
+            url="https://example.com/sec-nms-relief",
+            summary="Temporary exemptive relief from tick-size and access-fee provisions in Regulation NMS.",
+            extraction_method="feed_item",
+        )
+
+        self.assertFalse(passes_rule_filter(item))
+        analysis = analyze_item(item)
+        self.assertLess(analysis.alert_score, 35)
+        self.assertNotIn("regulation", analysis.asset_classes)
+
+    def test_generic_hkma_scam_alert_is_filtered_even_from_regulator_source(self):
+        item = RawItem(
+            source_name="HKMA Press Releases RSS",
+            source_kind="rss",
+            source_url="https://www.hkma.gov.hk",
+            source_category="regulator",
+            title="Scam alert related to banks",
+            url="https://example.com/hkma-scam-alert",
+            summary="The Hong Kong Monetary Authority alerts the public to fraudulent bank messages.",
+            extraction_method="feed_item",
+        )
+
+        self.assertFalse(passes_rule_filter(item))
+        analysis = analyze_item(item)
+        self.assertLess(analysis.alert_score, 35)
+
+    def test_generic_stock_admission_is_not_tokenized_equities_signal(self):
+        item = RawItem(
+            source_name="HKEX HKSCC Participant Circulars",
+            source_kind="web",
+            source_url="https://www.hkex.com.hk",
+            source_category="regulator",
+            title="Stock Admission - New Listing of Securities",
+            url="https://example.com/hkex-stock-admission",
+            summary="HKEX announces admission of securities for trading and clearing in CCASS.",
+            extraction_method="listing_item",
+        )
+
+        self.assertFalse(passes_rule_filter(item))
+        analysis = analyze_item(item)
+        self.assertLess(analysis.alert_score, 35)
+        self.assertNotIn("tokenized_equities", analysis.asset_classes)
+
+    def test_generic_cex_token_rename_and_delist_are_filtered_without_rwa_context(self):
+        rename_item = RawItem(
+            source_name="KuCoin Announcements",
+            source_kind="announcement",
+            source_url="https://www.kucoin.com",
+            source_category="cex",
+            title="KuCoin Has Completed the Rename of Toncoin (TON) to Gram (GRAM)",
+            url="https://example.com/kucoin-rename",
+            summary="KuCoin completed a token ticker rename and reopened deposits and withdrawals.",
+            extraction_method="listing_item",
+        )
+        delist_item = RawItem(
+            source_name="KuCoin Announcements",
+            source_kind="announcement",
+            source_url="https://www.kucoin.com",
+            source_category="cex",
+            title="ST: KuCoin Will Delist Certain Projects & Their Associated Tokens",
+            url="https://example.com/kucoin-delist",
+            summary="KuCoin will delist several tokens and close withdrawals later.",
+            extraction_method="listing_item",
+        )
+
+        for item in [rename_item, delist_item]:
+            self.assertFalse(passes_rule_filter(item))
+            analysis = analyze_item(item)
+            self.assertLess(analysis.alert_score, 35)
+
+    def test_cex_footer_navigation_keywords_do_not_make_generic_delist_relevant(self):
+        item = RawItem(
+            source_name="KuCoin Announcements",
+            source_kind="announcement",
+            source_url="https://www.kucoin.com",
+            source_category="cex",
+            title="ST: KuCoin Will Delist Certain Projects & Their Associated Tokens",
+            url="https://example.com/kucoin-delist-with-footer",
+            summary="KuCoin will delist several tokens and close withdrawals later.",
+            raw_text=(
+                "KuCoin will delist several tokens and close withdrawals later. "
+                + ("withdrawal instructions " * 80)
+                + " Top Articles Proof of Reserves AML crypto wallet maintenance"
+            ),
+            extraction_method="listing_item",
+        )
+
+        self.assertFalse(passes_rule_filter(item))
+        analysis = analyze_item(item)
+        self.assertLess(analysis.alert_score, 35)
+
+    def test_exchange_rwa_product_signal_scores_high(self):
+        item = RawItem(
+            source_name="Bybit Announcements Web",
+            source_kind="web",
+            source_url="https://announcements.bybit.com",
+            source_category="cex",
+            title="Bybit launches RWA Earn, featuring a limited-time APR boost event",
+            url="https://example.com/bybit-rwa-earn",
+            summary="Bybit launches RWA Earn for real-world asset products and tokenized yield access.",
+            extraction_method="listing_item",
+        )
+
+        self.assertTrue(passes_rule_filter(item))
+        analysis = analyze_item(item)
+        self.assertGreaterEqual(analysis.alert_score, 70)
+        self.assertIn("rwa", analysis.categories)
+
+    def test_rank_alert_items_keeps_generic_noise_below_topical_items(self):
+        relevant = RawItem(
+            source_name="Exchange",
+            source_kind="web",
+            source_url="https://example.com",
+            source_category="cex",
+            title="Exchange launches tokenized stock product with stablecoin settlement",
+            url="https://example.com/tokenized-stock",
+            summary="The product supports tokenized equities and stablecoin settlement.",
+            extraction_method="listing_item",
+        )
+        noise = RawItem(
+            source_name="HKMA Press Releases RSS",
+            source_kind="rss",
+            source_url="https://www.hkma.gov.hk",
+            source_category="regulator",
+            title="Scam alert related to banks",
+            url="https://example.com/scam",
+            summary="A public warning about fraudulent bank messages.",
+            extraction_method="feed_item",
+        )
+
+        ranked = rank_alert_items([(noise, analyze_item(noise)), (relevant, analyze_item(relevant))])
+
+        self.assertEqual(ranked[0][0].url, relevant.url)
+        self.assertLess(ranked[1][1].alert_score, 35)
+
     def test_strong_regulatory_stablecoin_signal_scores_high(self):
         item = RawItem(
             source_name="Regulator",
@@ -167,6 +352,100 @@ class RwaIntelMvpTests(unittest.TestCase):
             self.assertIn(domain, urls)
         for expected in ["Binance Announcements", "Coinbase Blog", "OKX Announcements", "Uniswap Governance", "Aave Governance"]:
             self.assertIn(expected, names)
+
+    def test_default_sources_include_regulatory_supplement_and_classification(self):
+        sources = load_sources()
+        names = {source.name for source in sources}
+        for expected in [
+            "SEC National Securities Exchanges SRO Comments",
+            "DTCC All SEC Rule Filings",
+            "BoE Publications RSS",
+            "HKEX HKSCC Rule Updates",
+            "DFSA Rulebook RSS",
+            "AFSA RSS",
+            "SEC Crypto@SEC",
+            "Federal Reserve Banking Regulation RSS",
+            "OCC Bulletins RSS",
+            "FDIC Press Releases RSS",
+            "FinCEN News",
+            "Treasury Press Releases",
+            "IRS Digital Assets",
+            "GovInfo Congressional Bills RSS",
+            "White House Digital Assets Report",
+            "NYDFS Industry Letters",
+            "EBA News and Press RSS",
+            "FSB Policy Documents RSS",
+            "BIS Press Releases RSS",
+        ]:
+            self.assertIn(expected, names)
+        regulatory = filter_sources(sources, "regulatory")
+        messages = filter_sources(sources, "message")
+        self.assertGreater(len(regulatory), 0)
+        self.assertGreater(len(messages), 0)
+        self.assertTrue(all(source.source_class == "regulatory" for source in regulatory))
+        self.assertTrue(all(source.source_class == "message" for source in messages))
+        self.assertTrue(all(source.schedule_frequency == "weekly" for source in regulatory))
+        self.assertTrue(all(source.schedule_frequency == "daily" for source in messages))
+
+    def test_source_classification_defaults_from_category(self):
+        regulator = Source.from_dict(
+            {
+                "name": "Regulator",
+                "kind": "rss",
+                "url": "https://example.com/regulator.xml",
+                "category": "regulator",
+            }
+        )
+        exchange = Source.from_dict(
+            {
+                "name": "Exchange Announcements",
+                "kind": "web",
+                "url": "https://example.com/announcements",
+                "category": "cex",
+            }
+        )
+        explicit = Source.from_dict(
+            {
+                "name": "DTCC Infrastructure",
+                "kind": "rss",
+                "url": "https://example.com/dtcc.xml",
+                "category": "rwa-infrastructure",
+                "source_class": "regulatory",
+            }
+        )
+        self.assertEqual(regulator.source_class, "regulatory")
+        self.assertEqual(regulator.schedule_frequency, "weekly")
+        self.assertEqual(exchange.source_class, "message")
+        self.assertEqual(exchange.schedule_frequency, "daily")
+        self.assertEqual(explicit.source_class, "regulatory")
+        self.assertEqual(explicit.schedule_frequency, "weekly")
+
+    def test_load_sources_filters_by_source_class(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sources.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "name": "Regulator",
+                                "kind": "rss",
+                                "url": "https://example.com/regulator.xml",
+                                "category": "regulator",
+                            },
+                            {
+                                "name": "Exchange",
+                                "kind": "rss",
+                                "url": "https://example.com/exchange.xml",
+                                "category": "cex",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual([source.name for source in load_sources(path, source_class="regulatory")], ["Regulator"])
+            self.assertEqual([source.name for source in load_sources(path, source_class="message")], ["Exchange"])
 
     def test_api_source_supports_nested_paths(self):
         source = Source(
@@ -650,6 +929,45 @@ class RwaIntelMvpTests(unittest.TestCase):
         self.assertEqual(row["url"], item.url)
         self.assertNotIn("raw_text", row)
 
+    def test_supabase_payload_strips_postgres_nul_characters(self):
+        payload = {
+            "title": "SEC\x00crypto update",
+            "reasons": ["tokenization\x00policy"],
+            "score": 90,
+        }
+
+        clean = _strip_postgres_nuls(payload)
+
+        self.assertEqual(clean["title"], "SECcrypto update")
+        self.assertEqual(clean["reasons"], ["tokenizationpolicy"])
+        self.assertEqual(clean["score"], 90)
+
+    def test_supabase_request_retries_transient_ssl_eof(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return None
+
+            def read(self):
+                return b'[{"ok": true}]'
+
+        transient = urllib.error.URLError(
+            "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1000)"
+        )
+        with patch("urllib.request.urlopen", side_effect=[transient, FakeResponse()]) as urlopen:
+            with patch("rwa_intel_mvp.supabase.time.sleep") as sleep:
+                result = _request_json(
+                    "GET",
+                    "https://project.supabase.co/rest/v1/crypto_intel_items?select=title",
+                    "secret",
+                )
+
+        self.assertEqual(result, [{"ok": True}])
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once()
+
     def test_deepseek_request_defaults_to_flash_and_short_context(self):
         item = self.sample_item()
         item.raw_text = " ".join(["BlackRock BUIDL tokenized treasury collateral"] * 200)
@@ -909,13 +1227,125 @@ class RwaIntelMvpTests(unittest.TestCase):
         self.assertIn("limit=500", endpoint)
         self.assertIn("or=", endpoint)
 
-    def test_cli_exposes_supabase_dashboard_and_scheduler_not_legacy_storage(self):
+    def test_supabase_brief_query_uses_card_fields_and_filters(self):
+        with patch("rwa_intel_mvp.supabase._request_json", return_value=[self.supabase_brief_row()]) as request_json:
+            rows = fetch_supabase_brief_rows(
+                supabase_url="https://project.supabase.co",
+                supabase_key="secret",
+                statuses=["selected", "sent"],
+                run_date_gte="2026-06-16",
+                min_score=70,
+                limit=999,
+            )
+
+        endpoint = request_json.call_args.args[1]
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(endpoint).query)
+        selected_fields = query["select"][0]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("title", selected_fields)
+        self.assertIn("source_name", selected_fields)
+        self.assertIn("published_at", selected_fields)
+        self.assertIn("summary", selected_fields)
+        self.assertIn("alert_score", selected_fields)
+        self.assertIn("business_impact", selected_fields)
+        self.assertIn("status=in.(selected,sent)", endpoint)
+        self.assertIn("run_date=gte.2026-06-16", endpoint)
+        self.assertIn("alert_score=gte.70", endpoint)
+        self.assertIn("limit=500", endpoint)
+
+    def test_cli_exposes_supabase_dashboard_scheduler_and_obsidian_sync(self):
         help_text = build_parser().format_help()
         self.assertIn("dashboard", help_text)
         self.assertIn("schedule", help_text)
-        self.assertNotIn("obsidian", help_text.lower())
+        self.assertIn("send-supabase", help_text)
+        args = build_parser().parse_args(["run", "--obsidian-sync", "--obsidian-vault", "D:\\vault"])
+        self.assertTrue(args.obsidian_sync)
+        self.assertEqual(args.obsidian_vault, "D:\\vault")
+        send_args = build_parser().parse_args(["send-supabase", "--preset", "sec", "--top-n", "10", "--dry-run"])
+        self.assertEqual(send_args.preset, "sec")
+        self.assertEqual(send_args.top_n, 10)
+        self.assertIsNone(send_args.days)
+        self.assertTrue(send_args.dry_run)
 
-    def test_scheduler_once_runs_default_daily_production_pipeline(self):
+    def test_send_supabase_dry_run_filters_sec_preset_without_sending(self):
+        sec_row = self.supabase_brief_row()
+        kucoin_row = self.supabase_brief_row(
+            title="KuCoin Has Completed the Rename of Toncoin to Gram",
+            url="https://www.kucoin.com/announcement/rename-toncoin",
+            source_name="KuCoin Announcements",
+            source_kind="announcement",
+            source_url="https://www.kucoin.com/announcement",
+            summary="KuCoin completed a token ticker rename.",
+            categories=["exchange_operations"],
+            asset_classes=["exchange_operations"],
+            alert_score=99,
+            importance_score=99,
+        )
+        args = build_parser().parse_args(
+            [
+                "send-supabase",
+                "--preset",
+                "sec",
+                "--top-n",
+                "10",
+                "--dry-run",
+                "--supabase-url",
+                "https://project.supabase.co",
+                "--supabase-key",
+                "secret",
+            ]
+        )
+
+        stdout = io.StringIO()
+        with patch("sys.stdout", stdout):
+            with patch("rwa_intel_mvp.cli.fetch_supabase_brief_rows", return_value=[kucoin_row, sec_row]) as fetch_rows:
+                with patch("rwa_intel_mvp.cli.send_text") as send_text:
+                    code = cli_module.send_supabase(args)
+
+        self.assertEqual(code, 0)
+        send_text.assert_not_called()
+        fetch_kwargs = fetch_rows.call_args.kwargs
+        self.assertIsNone(fetch_kwargs["run_date_gte"])
+        output = stdout.getvalue()
+        self.assertIn(sec_row["title"], output)
+        self.assertNotIn(kucoin_row["title"], output)
+        summary = json.loads(output.split("\n\n--- Feishu message preview ---\n\n", 1)[0])
+        self.assertEqual(summary["preset"], "sec")
+        self.assertEqual(summary["card_items"], 1)
+        self.assertFalse(summary["writeback"])
+
+    def test_send_supabase_live_sends_without_marking_alert_sent(self):
+        row = self.supabase_brief_row(status="selected", alert_sent_at=None)
+        args = build_parser().parse_args(
+            [
+                "send-supabase",
+                "--preset",
+                "recent",
+                "--top-n",
+                "1",
+                "--supabase-url",
+                "https://project.supabase.co",
+                "--supabase-key",
+                "secret",
+                "--webhook-url",
+                "https://feishu.example/hook",
+            ]
+        )
+
+        with patch("sys.stdout", io.StringIO()):
+            with patch("rwa_intel_mvp.cli.fetch_supabase_brief_rows", return_value=[row]):
+                with patch("rwa_intel_mvp.cli.send_text", return_value={"code": 0}) as send_text:
+                    with patch("rwa_intel_mvp.cli.mark_alert_sent") as mark_alert_sent:
+                        code = cli_module.send_supabase(args)
+
+        self.assertEqual(code, 0)
+        send_text.assert_called_once()
+        payload = send_text.call_args.kwargs["payload"]
+        self.assertEqual(payload["msg_type"], "interactive")
+        mark_alert_sent.assert_not_called()
+
+
+    def test_scheduler_once_runs_default_daily_message_pipeline(self):
         args = build_parser().parse_args(
             [
                 "schedule",
@@ -937,6 +1367,7 @@ class RwaIntelMvpTests(unittest.TestCase):
         scheduled_args = run_pipeline_once.call_args.args[0]
         self.assertEqual(scheduled_args.command, "run")
         self.assertEqual(scheduled_args.sources, args.sources)
+        self.assertEqual(scheduled_args.source_class, "message")
         self.assertEqual(scheduled_args.limit_per_source, 8)
         self.assertEqual(scheduled_args.min_score, 70)
         self.assertEqual(scheduled_args.top_n, 10)
@@ -953,6 +1384,72 @@ class RwaIntelMvpTests(unittest.TestCase):
         self.assertEqual(scheduled_args.supabase_url, "https://project.supabase.co")
         self.assertEqual(scheduled_args.supabase_key, "secret")
         self.assertEqual(scheduled_args.webhook_url, "https://feishu.example/hook")
+
+    def test_scheduler_once_weekly_defaults_to_regulatory_sources_and_all_dates(self):
+        args = build_parser().parse_args(
+            [
+                "schedule",
+                "--once",
+                "--frequency",
+                "weekly",
+                "--supabase-url",
+                "https://project.supabase.co",
+                "--supabase-key",
+                "secret",
+                "--webhook-url",
+                "https://feishu.example/hook",
+            ]
+        )
+        scheduled_args = _scheduled_run_args(args)
+        self.assertEqual(scheduled_args.source_class, "regulatory")
+        self.assertTrue(scheduled_args.all_dates)
+        self.assertTrue(scheduled_args.reanalyze_seen)
+
+    def test_obsidian_sync_writes_markdown_under_controlled_subdirectory(self):
+        item = self.sample_item()
+        analysis = analyze_item(item)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vault = Path(tmpdir)
+            keep = vault / "Keep.md"
+            keep.write_text("existing note", encoding="utf-8")
+            output = sync_obsidian_brief(
+                [(item, analysis)],
+                vault_path=vault,
+                folder="RWA Intel",
+                now=datetime(2026, 6, 15, 16, 30),
+            )
+            self.assertTrue(output.exists())
+            self.assertEqual(output.parent.resolve(), (vault / "RWA Intel").resolve())
+            self.assertEqual(keep.read_text(encoding="utf-8"), "existing note")
+            content = output.read_text(encoding="utf-8")
+            self.assertIn(item.title, content)
+            self.assertIn(item.url, content)
+            self.assertIn("source: Sample", content)
+
+    def test_run_pipeline_syncs_selected_items_to_obsidian_when_enabled(self):
+        item = self.sample_item()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = build_parser().parse_args(
+                [
+                    "run",
+                    "--no-supabase",
+                    "--no-feishu",
+                    "--no-rule-filter",
+                    "--obsidian-sync",
+                    "--obsidian-vault",
+                    tmpdir,
+                    "--top-n",
+                    "1",
+                ]
+            )
+            with patch("sys.stdout", io.StringIO()):
+                with patch("rwa_intel_mvp.cli.collect_sources", return_value=([item], [])):
+                    with patch("rwa_intel_mvp.cli.deepseek_brief_summary", return_value="中文摘要"):
+                        code = run_pipeline(args)
+            self.assertEqual(code, 0)
+            notes = list((Path(tmpdir) / "RWA Intel").glob("*.md"))
+            self.assertEqual(len(notes), 1)
+            self.assertIn(item.title, notes[0].read_text(encoding="utf-8"))
 
     def test_cli_marks_only_alerts_rendered_in_top_n_message(self):
         item_one = self.sample_item()
@@ -993,7 +1490,7 @@ class RwaIntelMvpTests(unittest.TestCase):
         self.assertEqual(send_text.call_args.kwargs["payload"]["msg_type"], "interactive")
         self.assertEqual(send_text.call_args.kwargs["payload"]["card"]["schema"], "2.0")
 
-    def test_cli_reanalysis_card_includes_ranked_selected_items_beyond_new_alerts(self):
+    def test_cli_reanalysis_card_includes_ranked_selected_items_but_excludes_noise(self):
         old_item = self.sample_item()
         new_item = RawItem(
             source_name="Sample",
@@ -1004,12 +1501,14 @@ class RwaIntelMvpTests(unittest.TestCase):
             summary="Ondo tokenized treasury collateral and stablecoin settlement update.",
         )
         background_item = RawItem(
-            source_name="Sample",
+            source_name="HKMA Press Releases RSS",
             source_kind="rss",
-            source_url="https://example.com/feed",
-            title="Weekly stablecoin market commentary",
+            source_url="https://www.hkma.gov.hk",
+            source_category="regulator",
+            title="Scam alert related to banks",
             url="https://example.com/news/3",
-            summary="Stablecoin liquidity overview and weekly market commentary.",
+            summary="The Hong Kong Monetary Authority alerts the public to fraudulent bank messages.",
+            extraction_method="feed_item",
         )
         old_state = SupabaseItemState(
             item_hash=item_hash(old_item),
@@ -1050,12 +1549,12 @@ class RwaIntelMvpTests(unittest.TestCase):
         payload_text = json.dumps(sent_payload, ensure_ascii=False)
         self.assertIn(old_item.title, payload_text)
         self.assertIn(new_item.title, payload_text)
-        self.assertIn(background_item.title, payload_text)
+        self.assertNotIn(background_item.title, payload_text)
         self.assertEqual(len(mark_alert_sent.call_args.args[0]), 1)
         self.assertEqual(mark_alert_sent.call_args.args[0][0][0].url, new_item.url)
         summary = json.loads(stdout.getvalue().split("\n\n--- Feishu message preview ---\n\n", 1)[0])
         self.assertEqual(summary["alerts_to_send"], 1)
-        self.assertEqual(summary["card_items"], 3)
+        self.assertEqual(summary["card_items"], 2)
 
     def test_feishu_summaries_default_to_single_worker(self):
         item_one = self.sample_item()
